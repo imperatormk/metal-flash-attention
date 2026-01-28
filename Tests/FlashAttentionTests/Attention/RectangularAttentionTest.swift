@@ -65,8 +65,8 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
   func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
     let device = MTLContext.global.device
     let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
-    
+    let library = try! device.makeLibraryWithFallback(source: source)
+
     let functionConstants = MTLFunctionConstantValues()
     attentionDesc.setFunctionConstants(functionConstants)
     let function = try! library.makeFunction(

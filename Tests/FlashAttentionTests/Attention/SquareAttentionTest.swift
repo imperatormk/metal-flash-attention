@@ -244,7 +244,7 @@ private func validateProblemSize(
   func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
     let device = MTLContext.global.device
     let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
+    let library = try! device.makeLibraryWithFallback(source: source)
     
     let functionConstants = MTLFunctionConstantValues()
     attentionDesc.setFunctionConstants(functionConstants)
@@ -589,7 +589,7 @@ private func profileProblemSize(
   func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
     let device = MTLContext.global.device
     let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
+    let library = try! device.makeLibraryWithFallback(source: source)
     
     let functionConstants = MTLFunctionConstantValues()
     attentionDesc.setFunctionConstants(functionConstants)

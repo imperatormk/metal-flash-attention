@@ -8,6 +8,7 @@
 extension GEMMKernel {
   public func createSource() -> String {
     return """
+#include <metal_stdlib>
 
 \(createMetalSimdgroupEvent())
 \(createMetalSimdgroupMatrixStorage())

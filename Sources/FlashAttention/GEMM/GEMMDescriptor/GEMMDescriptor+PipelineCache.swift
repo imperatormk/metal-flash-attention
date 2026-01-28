@@ -50,8 +50,8 @@ extension GEMMKernel {
       } else {
         let kernel = GEMMKernel(descriptor: kernelDescriptor)
         let source = kernel.createSource()
-        let library = try! device.makeLibrary(source: source, options: nil)
-        
+        let library = try! device.makeLibraryWithFallback(source: source)
+
         let output = (kernel, library)
         GEMMKernel.libraryCache[kernelDescriptor] = output
         return output

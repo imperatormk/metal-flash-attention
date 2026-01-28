@@ -21,7 +21,8 @@ extension AttentionKernel {
     }
     
     return """
-    
+    #include <metal_stdlib>
+
     \(createMetalSimdgroupEvent())
     \(createMetalSimdgroupMatrixStorage())
     using namespace metal;
