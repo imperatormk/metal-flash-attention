@@ -10,19 +10,28 @@ import Metal
 public struct AttentionDescriptor {
   // Q, K, V, dO
   public var lowPrecisionInputs: Bool = false
-  
+
   // S, P, L, D, dP, dS
   public var lowPrecisionIntermediates: Bool = false
-  
+
+  // O, dV, dK, dQ - when true, outputs are FP16 (forward) or BF16 (backward)
+  // Default is false for compatibility - outputs are always FP32
+  // Set to true for memory efficiency when input precision matches output needs
+  public var lowPrecisionOutputs: Bool = false
+
+  // Causal masking - when true, applies lower triangular mask to attention
+  // This prevents attending to future tokens (row index < column index is masked)
+  public var causal: Bool = false
+
   // row:    Output sequence length; rows of the attention matrix.
   // column: Input sequence length; columns of the attention matrix.
   // head:   Head dimension, typically 32 - 256.
   public var matrixDimensions: (row: UInt32, column: UInt32, head: UInt16)?
-  
+
   public var transposeState: (Q: Bool, K: Bool, V: Bool, O: Bool)?
-  
+
   public init() {
-    
+
   }
 }
 
@@ -125,7 +134,8 @@ extension AttentionDescriptor {
     output.registerPrecisions = registerPrecisions
     output.transposeState = createTransposeState()
     output.type = type
-    
+    output.causal = causal
+
     return output
   }
 }

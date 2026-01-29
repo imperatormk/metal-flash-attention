@@ -230,9 +230,9 @@ extension AttentionKernel {
     let remainder = "(\(traversalDimension) % \(blockDim))"
     let remainderFloor = "(\(remainder) - (\(remainder) % 8))";
     let logBase2E: Float = 1.442695041
-    
+
     return """
-    
+
     if ((\(remainder) != 0) &&
         (\(traversalOffset) + \(blockDim) > \(traversalDimension))) {
       // Prevent the value from becoming -INF during the FMA before the
@@ -241,7 +241,7 @@ extension AttentionKernel {
       // that. exp(0) evaluates to 1.00 and corrupts the value of 'l'.
       const \(registerName(.S)) mask_value =
       (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
-      
+
       #pragma clang loop unroll(full)
       for (ushort index = 0; index < 2; ++index) {
         if (morton_offset.x + index >= \(remainder) - \(remainderFloor)) {
@@ -255,8 +255,95 @@ extension AttentionKernel {
         *S_elements = mask_value;
       }
     }
-    
+
     """
+  }
+
+  // Apply causal masking: mask out positions where row < column (future tokens)
+  // For forward/backwardQuery: row is the parallelization dim, column is traversal
+  // For backwardKeyValue: we compute S^T, so row and column are swapped
+  func maskCausal() -> String {
+    guard causal else { return "" }
+
+    let logBase2E: Float = 1.442695041
+    let blockDim = blockDimensions.traversal
+
+    // In forward/backwardQuery: S[row, col], mask where row < col
+    // In backwardKeyValue: we compute S^T = K * Q^T, so S^T[kv_pos, q_pos]
+    //   This is P^T where P = softmax(S). For causal: S[q, kv] masked where q < kv
+    //   So S^T[kv, q] is masked where q < kv, i.e., col < row in S^T space
+    //   But we're iterating q (traversal), kv (parallelization)
+    //   Mask where: traversal_idx < parallelization_idx (the Q position < KV position)
+
+    switch type {
+    case .forward, .backwardQuery:
+      // row = parallelization position (Q position), col = traversal position (KV position)
+      // Mask where row < col (can't attend to future)
+      return """
+
+      // Causal masking: mask positions where row_idx < col_idx
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current row position (Q position within the sequence)
+        uint row_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort c_block = 0; c_block < \(blockDim); c_block += 8) {
+          // Column position (KV position within the sequence)
+          uint col_base = \(traversalOffset) + c_block;
+
+          auto S_elements = S_sram[c_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint col_idx = col_base + morton_offset.x + index;
+            // Mask if row < col (future position)
+            if (row_idx < col_idx) {
+              (*S_elements)[index] = mask_value;
+            }
+          }
+        }
+      }
+
+      """
+
+    case .backwardKeyValue:
+      // In backwardKeyValue, we compute S^T = K * Q^T
+      // parallelization = KV position, traversal = Q position
+      // We need P^T where P[q, kv] has causal mask (q < kv is masked)
+      // So P^T[kv, q] should mask where q < kv, i.e., traversal_idx < parallelization_idx
+      return """
+
+      // Causal masking for backward KV: mask positions where q_idx < kv_idx
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current KV position (parallelization dimension)
+        uint kv_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort r_block = 0; r_block < \(blockDim); r_block += 8) {
+          // Q position (traversal dimension)
+          uint q_base = \(traversalOffset) + r_block;
+
+          auto S_elements = S_sram[r_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint q_idx = q_base + morton_offset.x + index;
+            // Mask if q < kv (this position was masked in forward pass)
+            if (q_idx < kv_idx) {
+              (*S_elements)[index] = mask_value;
+            }
+          }
+        }
+      }
+
+      """
+    }
   }
 }
 

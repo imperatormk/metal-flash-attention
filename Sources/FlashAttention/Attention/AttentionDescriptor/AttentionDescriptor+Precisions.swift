@@ -131,16 +131,22 @@ extension AttentionDescriptor {
     // supermassive head dimensions that require register spilling, and
     // therefore an FP32 memory allocation for O.
     //
-    // I don't know the best way to resolve this. It seems like something the
-    // client should deal with. Therefore, the MFA reference implementation
-    // will always write O as FP32 in memory. This choice simplifies
-    // everything, just like the choice to always store log-sum-exp during the
-    // forward pass. It also removes the concern of rounding error from
-    // frequently truncating the FP32 numbers to FP16.
-    memoryPrecisions[.O] = .FP32
-    memoryPrecisions[.dV] = .FP32
-    memoryPrecisions[.dK] = .FP32
-    memoryPrecisions[.dQ] = .FP32
+    // The client can choose to output in lower precision for memory efficiency.
+    // When lowPrecisionOutputs is true:
+    // - O uses FP16 (matching typical inference needs)
+    // - dV/dK/dQ use BF16 (matching typical training needs)
+    // Default is FP32 for maximum accuracy and compatibility.
+    if lowPrecisionOutputs {
+      memoryPrecisions[.O] = .FP16
+      memoryPrecisions[.dV] = .BF16
+      memoryPrecisions[.dK] = .BF16
+      memoryPrecisions[.dQ] = .BF16
+    } else {
+      memoryPrecisions[.O] = .FP32
+      memoryPrecisions[.dV] = .FP32
+      memoryPrecisions[.dK] = .FP32
+      memoryPrecisions[.dQ] = .FP32
+    }
     
     return memoryPrecisions
   }

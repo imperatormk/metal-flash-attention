@@ -172,31 +172,32 @@ extension AttentionKernel {
     let PV = accumulate(descriptor: accumulateDesc)
     
     return """
-    
+
     // Outer loop over the traversal dimension.
     for (uint c = 0; c < C; c += \(blockDimensions.traversal)) {
       // S = Q * K^T
       \(QKT)
       \(maskAttentionMatrixEdge())
-      
+      \(maskCausal())
+
       // m = reduce(m)
       \(onlineReduceMaximum())
-      
+
       // correction = exp(m_old) / exp(m_new)
       \(onlineCorrectO())
-      
+
       // P = softmax(S * scaleFactor)
       \(softmax(derivative: false))
-      
+
       // l = reduce(l)
       \(onlineReduceSum())
-      
+
       // O *= correction
       // O += P * V
       // O /= l
       \(PV)
     }
-    
+
     """
   }
   
@@ -220,25 +221,26 @@ extension AttentionKernel {
     let dSK = accumulate(descriptor: accumulateDesc)
     
     return """
-    
+
     // Outer loop over the traversal dimension.
     for (uint c = 0; c < C; c += \(blockDimensions.traversal)) {
       // S = Q * K^T
       \(QKT)
-      
+      \(maskCausal())
+
       // P = softmax(S * scaleFactor)
       \(softmax(derivative: false))
-      
+
       // dP = dO * V^T
       \(dOVT)
-      
+
       // dS = P * (dP - D) * scaleFactor
       \(softmax(derivative: true))
-      
+
       // dQ += dS * K
       \(dSK)
     }
-    
+
     """
   }
   
@@ -268,28 +270,29 @@ extension AttentionKernel {
     let dSTQ = accumulate(descriptor: accumulateDesc)
     
     return """
-    
+
     // Outer loop over the traversal dimension.
     for (uint r = 0; r < R; r += \(blockDimensions.traversal)) {
       // S^T = K * Q^T
       \(KQT)
-      
+      \(maskCausal())
+
       // P^T = exp(S^T - L)
       \(softmax(derivative: false))
-      
+
       // dV += P^T * dO
       \(PTdO)
-      
+
       // dP^T = V * dO^T
       \(VdOT)
-      
+
       // dS^T = P^T * (dP^T - D) * scaleFactor
       \(softmax(derivative: true))
-      
+
       // dK += dS^T * Q
       \(dSTQ)
     }
-    
+
     """
   }
 }

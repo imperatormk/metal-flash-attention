@@ -9,7 +9,7 @@
 
 public struct AttentionKernel {
   var type: AttentionKernelType
-  
+
   // Categorical attributes for each operand.
   var cacheState: [AttentionOperand: Bool]
   var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision]
@@ -17,13 +17,16 @@ public struct AttentionKernel {
   var preferAsyncLoad: Bool
   var registerPrecisions: [AttentionOperand: GEMMOperandPrecision]
   var transposeState: [AttentionOperand: Bool]
-  
+
   // Layout of the data in registers and threadgroup memory.
   public var blockDimensions: (
     parallelization: UInt16, traversal: UInt16, head: UInt16)
   var headDimension: UInt16
   public var threadgroupMemoryAllocation: UInt16
-  
+
+  // Causal masking
+  var causal: Bool
+
   public init(descriptor: AttentionKernelDescriptor) {
     guard let blockDimensions = descriptor.blockDimensions,
           let headDimension = descriptor.headDimension,
@@ -33,17 +36,18 @@ public struct AttentionKernel {
       fatalError("Descriptor was incomplete.")
     }
     self.type = type
-    
+
     self.cacheState = descriptor.cacheState
     self.memoryPrecisions = descriptor.memoryPrecisions
     self.preferAsyncCache = preferAsyncCache
     self.preferAsyncLoad = preferAsyncLoad
     self.registerPrecisions = descriptor.registerPrecisions
     self.transposeState = descriptor.transposeState
-    
+
     self.blockDimensions = blockDimensions
     self.headDimension = headDimension
-    
+    self.causal = descriptor.causal
+
     // Pick the threadgroup memory allocation size.
     threadgroupMemoryAllocation = .zero
     threadgroupMemoryAllocation = createThreadgroupMemoryAllocation()
