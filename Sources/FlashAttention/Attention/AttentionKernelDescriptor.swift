@@ -46,6 +46,9 @@ public struct AttentionKernelDescriptor {
   /// Causal masking - applies lower triangular mask to prevent attending to future tokens
   public var causal: Bool = false
 
+  /// External attention mask - when true, expects a boolean mask buffer
+  public var hasMask: Bool = false
+
   public init() {
 
   }

@@ -27,6 +27,9 @@ public struct AttentionKernel {
   // Causal masking
   var causal: Bool
 
+  // External attention mask
+  var hasMask: Bool
+
   public init(descriptor: AttentionKernelDescriptor) {
     guard let blockDimensions = descriptor.blockDimensions,
           let headDimension = descriptor.headDimension,
@@ -47,6 +50,7 @@ public struct AttentionKernel {
     self.blockDimensions = blockDimensions
     self.headDimension = headDimension
     self.causal = descriptor.causal
+    self.hasMask = descriptor.hasMask
 
     // Pick the threadgroup memory allocation size.
     threadgroupMemoryAllocation = .zero

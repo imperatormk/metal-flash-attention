@@ -81,24 +81,40 @@ extension AttentionKernel {
       // omit the 'L' operand.
       operands += [.Q, .K, .V, .O]
       operands += [.L]
+      if hasMask {
+        operands += [.mask]
+      }
     case .backwardQuery:
       operands += [.Q, .K, .V, .O]
       operands += [.dO, .dQ]
       operands += [.L, .D]
+      if hasMask {
+        operands += [.mask]
+      }
     case .backwardKeyValue:
       operands += [.Q, .K, .V]
       operands += [.dO, .dV, .dK]
       operands += [.L, .D]
+      if hasMask {
+        operands += [.mask]
+      }
     }
     operands.sort {
       $0.bufferBinding! < $1.bufferBinding!
     }
-    
+
     var output: String = ""
     for operand in operands {
-      var line = "device \(memoryName(operand))* \(operand) "
-      line += "[[buffer(\(operand.bufferBinding!))]],"
-      output += "  " + line + "\n"
+      if operand == .mask {
+        // Mask is boolean (stored as uchar for Metal compatibility)
+        var line = "device const uchar* \(operand) "
+        line += "[[buffer(\(operand.bufferBinding!))]],"
+        output += "  " + line + "\n"
+      } else {
+        var line = "device \(memoryName(operand))* \(operand) "
+        line += "[[buffer(\(operand.bufferBinding!))]],"
+        output += "  " + line + "\n"
+      }
     }
     return output
   }
@@ -179,6 +195,7 @@ extension AttentionKernel {
       \(QKT)
       \(maskAttentionMatrixEdge())
       \(maskCausal())
+      \(maskWithExternalMask())
 
       // m = reduce(m)
       \(onlineReduceMaximum())
@@ -227,6 +244,7 @@ extension AttentionKernel {
       // S = Q * K^T
       \(QKT)
       \(maskCausal())
+      \(maskWithExternalMask())
 
       // P = softmax(S * scaleFactor)
       \(softmax(derivative: false))
@@ -276,6 +294,7 @@ extension AttentionKernel {
       // S^T = K * Q^T
       \(KQT)
       \(maskCausal())
+      \(maskWithExternalMask())
 
       // P^T = exp(S^T - L)
       \(softmax(derivative: false))

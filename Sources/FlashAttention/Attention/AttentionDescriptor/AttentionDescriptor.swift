@@ -23,6 +23,10 @@ public struct AttentionDescriptor {
   // This prevents attending to future tokens (row index < column index is masked)
   public var causal: Bool = false
 
+  // External attention mask - when true, expects a boolean mask buffer
+  // Mask shape: [seq_q, seq_k] where true = attend, false = mask out (-inf)
+  public var hasMask: Bool = false
+
   // row:    Output sequence length; rows of the attention matrix.
   // column: Input sequence length; columns of the attention matrix.
   // head:   Head dimension, typically 32 - 256.
@@ -135,6 +139,7 @@ extension AttentionDescriptor {
     output.transposeState = createTransposeState()
     output.type = type
     output.causal = causal
+    output.hasMask = hasMask
 
     return output
   }

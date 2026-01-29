@@ -259,6 +259,92 @@ extension AttentionKernel {
     """
   }
 
+  // Apply external attention mask from buffer
+  // Mask buffer is [seq_q, seq_k] where non-zero = masked (-inf), 0 = attend
+  // This matches PyTorch's boolean mask convention (True = masked)
+  func maskWithExternalMask() -> String {
+    guard hasMask else { return "" }
+
+    let logBase2E: Float = 1.442695041
+    let blockDim = blockDimensions.traversal
+
+    switch type {
+    case .forward, .backwardQuery:
+      // row = parallelization position (Q position), col = traversal position (KV position)
+      return """
+
+      // Apply external attention mask
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current row position (Q position within the sequence)
+        uint row_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort c_block = 0; c_block < \(blockDim); c_block += 8) {
+          // Column position (KV position within the sequence)
+          uint col_base = \(traversalOffset) + c_block;
+
+          auto S_elements = S_sram[c_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint col_idx = col_base + morton_offset.x + index;
+            // Check bounds and load mask value
+            if (row_idx < R && col_idx < C) {
+              uint mask_idx = row_idx * C + col_idx;
+              uchar mask_val = mask[mask_idx];
+              // mask_val != 0 means masked out (-inf), mask_val == 0 means attend
+              if (mask_val != 0) {
+                (*S_elements)[index] = mask_value;
+              }
+            }
+          }
+        }
+      }
+
+      """
+
+    case .backwardKeyValue:
+      // In backwardKeyValue, we compute S^T = K * Q^T
+      // parallelization = KV position, traversal = Q position
+      return """
+
+      // Apply external attention mask (transposed access for backward KV)
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current KV position (parallelization dimension)
+        uint kv_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort r_block = 0; r_block < \(blockDim); r_block += 8) {
+          // Q position (traversal dimension)
+          uint q_base = \(traversalOffset) + r_block;
+
+          auto S_elements = S_sram[r_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint q_idx = q_base + morton_offset.x + index;
+            // Check bounds and load mask value (mask is [Q, KV])
+            if (q_idx < R && kv_idx < C) {
+              uint mask_idx = q_idx * C + kv_idx;
+              uchar mask_val = mask[mask_idx];
+              if (mask_val != 0) {
+                (*S_elements)[index] = mask_value;
+              }
+            }
+          }
+        }
+      }
+
+      """
+    }
+  }
+
   // Apply causal masking: mask out positions where row < column (future tokens)
   // For forward/backwardQuery: row is the parallelization dim, column is traversal
   // For backwardKeyValue: we compute S^T, so row and column are swapped

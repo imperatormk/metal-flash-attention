@@ -23,6 +23,9 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
   case dS
   case dK
   case dQ
+
+  // External attention mask (boolean, true = attend, false = mask out)
+  case mask
   
   /// The name in the shader source.
   ///
@@ -46,6 +49,7 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
     case .dS: return "dS"
     case .dK: return "dK"
     case .dQ: return "dQ"
+    case .mask: return "mask"
     }
   }
   
@@ -67,6 +71,7 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
     case .dS: return nil
     case .dK: return 8
     case .dQ: return 9
+    case .mask: return 10
     }
   }
 }
