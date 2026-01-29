@@ -8,8 +8,12 @@
 import Metal
 
 public struct AttentionDescriptor {
-  // Q, K, V, dO
+  // Q, K, V, dO - when true, uses FP16 for inputs
   public var lowPrecisionInputs: Bool = false
+
+  // Q, K, V, dO - when true, uses BF16 for inputs (overrides lowPrecisionInputs)
+  // BF16 has same exponent range as FP32 so no overflow, but same memory as FP16
+  public var useBF16Inputs: Bool = false
 
   // S, P, L, D, dP, dS
   public var lowPrecisionIntermediates: Bool = false
@@ -18,6 +22,9 @@ public struct AttentionDescriptor {
   // Default is false for compatibility - outputs are always FP32
   // Set to true for memory efficiency when input precision matches output needs
   public var lowPrecisionOutputs: Bool = false
+
+  // O - when true, output O uses BF16 instead of FP16 (only applies when lowPrecisionOutputs=true)
+  public var useBF16Outputs: Bool = false
 
   // Causal masking - when true, applies lower triangular mask to attention
   // This prevents attending to future tokens (row index < column index is masked)

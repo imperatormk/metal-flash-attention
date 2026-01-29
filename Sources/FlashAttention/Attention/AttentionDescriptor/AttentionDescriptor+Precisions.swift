@@ -10,7 +10,13 @@ extension AttentionDescriptor {
   public var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] {
     var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] = [:]
     
-    if lowPrecisionInputs {
+    if useBF16Inputs {
+      // BF16 inputs - same exponent range as FP32, no overflow risk
+      memoryPrecisions[.Q] = .BF16
+      memoryPrecisions[.K] = .BF16
+      memoryPrecisions[.V] = .BF16
+      memoryPrecisions[.dO] = .BF16
+    } else if lowPrecisionInputs {
       memoryPrecisions[.Q] = .FP16
       memoryPrecisions[.K] = .FP16
       memoryPrecisions[.V] = .FP16
@@ -137,7 +143,8 @@ extension AttentionDescriptor {
     // - dV/dK/dQ use BF16 (matching typical training needs)
     // Default is FP32 for maximum accuracy and compatibility.
     if lowPrecisionOutputs {
-      memoryPrecisions[.O] = .FP16
+      // Use BF16 for output if useBF16Outputs is set, otherwise FP16
+      memoryPrecisions[.O] = useBF16Outputs ? .BF16 : .FP16
       memoryPrecisions[.dV] = .BF16
       memoryPrecisions[.dK] = .BF16
       memoryPrecisions[.dQ] = .BF16
@@ -161,7 +168,13 @@ extension AttentionDescriptor {
     let hasNativeBF16Casting = device.supportsFamily(.apple9)
     
     // Inputs have the same register precision across kernels.
-    if lowPrecisionInputs {
+    if useBF16Inputs {
+      // BF16 inputs - use native BF16 on M3+ or FP32 on older
+      registerPrecisions[.Q] = hasNativeBF16Casting ? .BF16 : .FP32
+      registerPrecisions[.K] = hasNativeBF16Casting ? .BF16 : .FP32
+      registerPrecisions[.V] = hasNativeBF16Casting ? .BF16 : .FP32
+      registerPrecisions[.dO] = hasNativeBF16Casting ? .BF16 : .FP32
+    } else if lowPrecisionInputs {
       registerPrecisions[.Q] = .FP16
       registerPrecisions[.K] = .FP16
       registerPrecisions[.V] = .FP16
