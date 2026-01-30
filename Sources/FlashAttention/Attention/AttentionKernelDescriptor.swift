@@ -49,6 +49,17 @@ public struct AttentionKernelDescriptor {
   /// External attention mask - when true, expects a boolean mask buffer
   public var hasMask: Bool = false
 
+  /// Sliding window attention size - if set, each token only attends to windowSize previous tokens
+  /// This enables efficient attention for models like Mistral and Llama 3.2
+  /// nil = full attention (default), 0 = full attention, >0 = sliding window of that size
+  public var windowSize: UInt32? = nil
+
+  /// Quantized K/V precision for memory-efficient inference
+  /// When set to a quantized format (FP8_E4M3, FP8_E5M2, INT8, NF4),
+  /// K and V are loaded from quantized buffers with per-head scales
+  /// nil = standard precision (default)
+  public var quantizedKV: GEMMOperandPrecision? = nil
+
   public init() {
 
   }

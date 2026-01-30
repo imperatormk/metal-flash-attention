@@ -34,6 +34,18 @@ public struct AttentionDescriptor {
   // Mask shape: [seq_q, seq_k] where true = attend, false = mask out (-inf)
   public var hasMask: Bool = false
 
+  // Sliding window attention - each token only attends to windowSize previous tokens
+  // nil or 0 = full attention (default), >0 = sliding window of that size
+  // Used by Mistral, Llama 3.2, and other efficient attention models
+  public var windowSize: UInt32? = nil
+
+  // Quantized K/V cache support for memory-efficient inference
+  // When set, K and V are stored in the specified quantized format with per-head scales
+  // Q remains in standard precision for computation accuracy
+  // Supported formats: .FP8_E4M3, .FP8_E5M2, .INT8, .NF4
+  // Set to nil (default) for standard precision K/V
+  public var quantizedKV: GEMMOperandPrecision? = nil
+
   // row:    Output sequence length; rows of the attention matrix.
   // column: Input sequence length; columns of the attention matrix.
   // head:   Head dimension, typically 32 - 256.
@@ -147,6 +159,8 @@ extension AttentionDescriptor {
     output.type = type
     output.causal = causal
     output.hasMask = hasMask
+    output.windowSize = windowSize
+    output.quantizedKV = quantizedKV
 
     return output
   }

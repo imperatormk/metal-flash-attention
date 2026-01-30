@@ -267,6 +267,7 @@ extension GEMMKernelDescriptor {
       case .FP32: return true
       case .FP16: return false
       case .BF16: return false
+      case .FP8_E4M3, .FP8_E5M2, .INT8, .NF4: return false  // Quantized are small
       }
     }
     var useLargeAllocation = false

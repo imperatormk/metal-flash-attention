@@ -30,6 +30,12 @@ public struct AttentionKernel {
   // External attention mask
   var hasMask: Bool
 
+  // Sliding window attention size (nil or 0 = full attention)
+  var windowSize: UInt32?
+
+  // Quantized K/V precision (nil = standard precision)
+  var quantizedKV: GEMMOperandPrecision?
+
   public init(descriptor: AttentionKernelDescriptor) {
     guard let blockDimensions = descriptor.blockDimensions,
           let headDimension = descriptor.headDimension,
@@ -51,6 +57,8 @@ public struct AttentionKernel {
     self.headDimension = headDimension
     self.causal = descriptor.causal
     self.hasMask = descriptor.hasMask
+    self.windowSize = descriptor.windowSize
+    self.quantizedKV = descriptor.quantizedKV
 
     // Pick the threadgroup memory allocation size.
     threadgroupMemoryAllocation = .zero
@@ -91,7 +99,14 @@ extension AttentionKernel {
           let registerPrecision = registerPrecisions[operand] else {
       fatalError("Precision of \(operand) was not specified.")
     }
-    
+
+    // Handle quantized formats - these use custom dequantization
+    if memoryPrecision.isQuantized {
+      // Quantized formats require special handling via dequantize functions
+      // The actual dequantization happens in the loading code, not here
+      return "load_quantized"  // Marker for custom loading path
+    }
+
     switch (memoryPrecision, registerPrecision) {
     case (.FP16, .FP16):
       return "load"
@@ -99,21 +114,31 @@ extension AttentionKernel {
       fatalError("Invalid precisions.")
     case (.FP16, .FP32):
       return "load"
-      
+
     case (.BF16, .FP16):
       fatalError("Invalid precisions.")
     case (.BF16, .BF16):
       return "load"
     case (.BF16, .FP32):
       return "load_bfloat"
-      
+
     case (.FP32, .FP16):
       fatalError("Invalid precisions.")
     case (.FP32, .BF16):
       fatalError("Invalid precisions.")
     case (.FP32, .FP32):
       return "load"
+    default:
+      fatalError("Unexpected precision combination: memory=\(memoryPrecision), register=\(registerPrecision)")
     }
+  }
+
+  /// Whether the operand uses quantized loading with dequantization
+  func isQuantizedLoad(_ operand: AttentionOperand) -> Bool {
+    guard let memoryPrecision = memoryPrecisions[operand] else {
+      return false
+    }
+    return memoryPrecision.isQuantized
   }
   
   func storeFunction(_ operand: AttentionOperand) -> String {
@@ -129,20 +154,26 @@ extension AttentionKernel {
       fatalError("Invalid precisions.")
     case (.FP16, .FP32):
       return "store"
-      
+
     case (.BF16, .FP16):
       fatalError("Invalid precisions.")
     case (.BF16, .BF16):
       return "store"
     case (.BF16, .FP32):
       return "store_bfloat"
-      
+
     case (.FP32, .FP16):
       fatalError("Invalid precisions.")
     case (.FP32, .BF16):
       fatalError("Invalid precisions.")
     case (.FP32, .FP32):
       return "store"
+
+    // Quantized formats don't support store (read-only)
+    case (.FP8_E4M3, _), (.FP8_E5M2, _), (.INT8, _), (.NF4, _):
+      fatalError("Cannot store to quantized formats")
+    case (_, .FP8_E4M3), (_, .FP8_E5M2), (_, .INT8), (_, .NF4):
+      fatalError("Cannot store from quantized register format")
     }
   }
   

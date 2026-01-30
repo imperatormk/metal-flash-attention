@@ -345,6 +345,90 @@ extension AttentionKernel {
     }
   }
 
+  // Apply sliding window masking: each token only attends to windowSize previous tokens
+  // Mask positions where col_idx < row_idx - windowSize (tokens too far in the past)
+  // Combined with causal, this creates: row_idx - windowSize <= col_idx <= row_idx
+  func maskSlidingWindow() -> String {
+    guard let windowSize = windowSize, windowSize > 0 else { return "" }
+
+    let logBase2E: Float = 1.442695041
+    let blockDim = blockDimensions.traversal
+
+    switch type {
+    case .forward, .backwardQuery:
+      // row = parallelization position (Q position), col = traversal position (KV position)
+      // Mask where col_idx < row_idx - windowSize (too far in the past)
+      return """
+
+      // Sliding window masking: mask positions where col_idx < row_idx - windowSize
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current row position (Q position within the sequence)
+        uint row_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+        // Calculate window start: positions before this are masked
+        int window_start = max(0, int(row_idx) - int(\(windowSize)));
+
+        #pragma clang loop unroll(full)
+        for (ushort c_block = 0; c_block < \(blockDim); c_block += 8) {
+          // Column position (KV position within the sequence)
+          uint col_base = \(traversalOffset) + c_block;
+
+          auto S_elements = S_sram[c_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            int col_idx = int(col_base + morton_offset.x + index);
+            // Mask if col_idx < window_start (too far in the past)
+            if (col_idx < window_start) {
+              (*S_elements)[index] = mask_value;
+            }
+          }
+        }
+      }
+
+      """
+
+    case .backwardKeyValue:
+      // In backwardKeyValue, we compute S^T = K * Q^T
+      // parallelization = KV position, traversal = Q position
+      // Sliding window: Q position must be within [KV position, KV position + windowSize]
+      // Equivalently: mask where traversal_idx < parallelization_idx - windowSize
+      return """
+
+      // Sliding window masking for backward KV
+      {
+        const \(registerName(.S)) mask_value =
+        (0.875 / \(logBase2E)) * -numeric_limits<\(registerName(.S))>::max();
+
+        // Current KV position (parallelization dimension)
+        uint kv_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort r_block = 0; r_block < \(blockDim); r_block += 8) {
+          // Q position (traversal dimension)
+          uint q_base = \(traversalOffset) + r_block;
+
+          auto S_elements = S_sram[r_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            int q_idx = int(q_base + morton_offset.x + index);
+            // For P^T[kv, q], the original P[q, kv] has sliding window
+            // P[q, kv] is masked when kv < q - windowSize
+            // So mask when kv_idx < q_idx - windowSize, i.e., q_idx > kv_idx + windowSize
+            if (q_idx > int(kv_idx) + int(\(windowSize))) {
+              (*S_elements)[index] = mask_value;
+            }
+          }
+        }
+      }
+
+      """
+    }
+  }
+
   // Apply causal masking: mask out positions where row < column (future tokens)
   // For forward/backwardQuery: row is the parallelization dim, column is traversal
   // For backwardKeyValue: we compute S^T, so row and column are swapped
@@ -462,14 +546,14 @@ extension AttentionKernel {
   // Rescale 'O' to reflect the new maximum.
   func onlineCorrectO() -> String {
     """
-    
+
     // update 'O'
     float correction = 1;
     if (m_new > m) {
       correction = fast::exp2(m - m_new);
       m = m_new;
     }
-    
+
     """
   }
   
@@ -578,15 +662,24 @@ extension AttentionKernel {
     
     func overwriteAttentionMatrixElements() -> String {
       let scale = dotProductScale(derivative: derivative)
-      
+
       if !derivative {
+        // Softmax: P = exp2(S * scale - m)
+        // When all positions in a row are masked, m = mask_value * scale.
+        // mask_value ≈ -39744 (unscaled), so m ≈ -10000 after scaling.
+        // Normal attention scores after scaling are in [-100, 100].
+        // If m < -1000, the row is fully masked and P should be 0.
         return """
-        
+
         auto S = *(S_sram[c / 8].thread_elements());
-        auto P = vec<\(registerName(.P)), 2>(
+        auto P_computed = vec<\(registerName(.P)), 2>(
           fast::exp2(float2(S) * \(scale) - float2(L_elements)));
+        // Fully masked rows have m < -1000; set P = 0 to avoid accumulating garbage
+        // Use vec<bool, 2> for proper SIMD select behavior
+        vec<bool, 2> row_masked(L_elements < -1000.0f);
+        auto P = select(P_computed, vec<\(registerName(.P)), 2>(0), row_masked);
         *(P_sram[c / 8].thread_elements()) = P;
-        
+
         """
       } else {
         return """

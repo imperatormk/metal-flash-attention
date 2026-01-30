@@ -9,7 +9,7 @@ extension AttentionDescriptor {
   // This is an expensive computed property. Access it sparingly!
   public var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] {
     var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] = [:]
-    
+
     if useBF16Inputs {
       // BF16 inputs - same exponent range as FP32, no overflow risk
       memoryPrecisions[.Q] = .BF16
@@ -26,6 +26,14 @@ extension AttentionDescriptor {
       memoryPrecisions[.K] = .FP32
       memoryPrecisions[.V] = .FP32
       memoryPrecisions[.dO] = .FP32
+    }
+
+    // Override K/V precision if quantized KV cache is enabled
+    // This allows K and V to be stored in quantized format for memory efficiency
+    // Q remains in high precision for accurate gradient computation
+    if let quantizedKV = self.quantizedKV {
+      memoryPrecisions[.K] = quantizedKV
+      memoryPrecisions[.V] = quantizedKV
     }
     
     // Rounding error. In the test that reported these errors, the average
@@ -184,6 +192,14 @@ extension AttentionDescriptor {
       registerPrecisions[.K] = .FP32
       registerPrecisions[.V] = .FP32
       registerPrecisions[.dO] = .FP32
+    }
+
+    // Override K/V register precision if quantized KV cache is enabled
+    // Quantized values are always dequantized to FP16 (half) in registers
+    // for efficient SIMD matrix operations
+    if let quantizedKV = self.quantizedKV, quantizedKV.isQuantized {
+      registerPrecisions[.K] = .FP16
+      registerPrecisions[.V] = .FP16
     }
     
     // The register precision of L/D only counts for backward key-value.

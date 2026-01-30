@@ -186,33 +186,59 @@ extension AttentionKernel {
     func declareRHSLocation(
       descriptor: LoopIterationDescriptor
     ) -> String {
+      // For quantized types, we can't use simdgroup_matrix_storage::apply_offset
+      // because it's only defined for half/float/bfloat. Compute offset manually.
+      let isQuant = isQuantizedLoad(B)
+
       switch descriptor.addressSpaceRHS! {
       case .device:
-        return """
-        
-        uint2 \(B)_src_offset(
-          morton_offset.y + d_outer,
-          morton_offset.x + \(traversalOffset));
-        auto \(B)_src = simdgroup_matrix_storage<\(memoryName(B))>
-        ::apply_offset(
-          \(B), \(leadingDimension(B)),
-          \(B)_src_offset, \(transposed(B)));
-        
-        """
+        if isQuant {
+          // For quantized types, save the outer loop offset before inner loop shadows it
+          // The inner loop uses local variable 'c' which shadows the outer loop's 'c'
+          return """
+
+          // Save outer loop offset for quantized loading (inner loop will shadow 'c')
+          uint \(B)_seq_base = \(traversalOffset);
+
+          """
+        } else {
+          return """
+
+          uint2 \(B)_src_offset(
+            morton_offset.y + d_outer,
+            morton_offset.x + \(traversalOffset));
+          auto \(B)_src = simdgroup_matrix_storage<\(memoryName(B))>
+          ::apply_offset(
+            \(B), \(leadingDimension(B)),
+            \(B)_src_offset, \(transposed(B)));
+
+          """
+        }
       case .threadgroup:
-        return """
-        
-        ushort2 \(B)_block_offset(
-          morton_offset.x,
-          morton_offset.y);
-        auto \(B)_src = (threadgroup \(memoryName(B))*)(threadgroup_block);
-        \(B)_src = simdgroup_matrix_storage<\(memoryName(B))>
-        ::apply_offset(
-          \(B)_src, \(leadingBlockDimension(B)),
-          \(B)_block_offset, \(!transposed(B)));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        
-        """
+        if isQuant {
+          // For quantized in threadgroup path, set up pointer to threadgroup memory
+          // Data was already copied in loadRHS, now just set up pointer for inner loop
+          return """
+
+          threadgroup uchar* \(B)_tg_base = (threadgroup uchar*)(threadgroup_block);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          """
+        } else {
+          return """
+
+          ushort2 \(B)_block_offset(
+            morton_offset.x,
+            morton_offset.y);
+          auto \(B)_src = (threadgroup \(memoryName(B))*)(threadgroup_block);
+          \(B)_src = simdgroup_matrix_storage<\(memoryName(B))>
+          ::apply_offset(
+            \(B)_src, \(leadingBlockDimension(B)),
+            \(B)_block_offset, \(!transposed(B)));
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          """
+        }
       }
     }
     
@@ -223,8 +249,47 @@ extension AttentionKernel {
       case .device:
         return declareRHSLocation(descriptor: descriptor)
       case .threadgroup:
+        let isQuant = isQuantizedLoad(B)
+        if isQuant {
+          // For quantized types, manually copy to threadgroup memory
+          // Can't use async_copy/apply_offset since they're not specialized for uchar
+          //
+          // We use ALL threads in simdgroup 0 to parallelize the copy
+          // Each thread copies a subset of the data
+          return """
+
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          // Manual copy of quantized K to threadgroup memory using all threads in sidx==0
+          if (sidx == 0) {
+            device const uchar* src = \(B);
+            threadgroup uchar* dst = (threadgroup uchar*)(threadgroup_block);
+
+            ushort D_dimension = min(
+              ushort(\(blockDimensions.head)),
+              ushort(\(headDimension) - d_outer));
+            ushort C_dimension = min(
+              uint(\(blockDimensions.traversal)),
+              uint(\(traversalDimension) - \(traversalOffset)));
+
+            // Copy tile: K[traversalOffset..+C_dimension, d_outer..+D_dimension]
+            // Storage is K[seq, head], so address = seq * headDim + head
+            // Parallelize across all 32 threads in the simdgroup
+            ushort total_elements = C_dimension * D_dimension;
+            for (ushort i = lane_id; i < total_elements; i += 32) {
+              ushort seq = i / D_dimension;
+              ushort head = i % D_dimension;
+              uint src_addr = (\(traversalOffset) + seq) * \(leadingDimension(B)) + (d_outer + head);
+              uint dst_addr = seq * \(leadingBlockDimension(B)) + head;
+              dst[dst_addr] = src[src_addr];
+            }
+          }
+
+          \(declareRHSLocation(descriptor: descriptor))
+
+          """
+        }
         return """
-        
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sidx == 0) {
           uint2 \(B)_offset(d_outer, \(traversalOffset));
@@ -233,7 +298,7 @@ extension AttentionKernel {
             \(B), \(leadingDimension(B)),
             \(B)_offset, \(transposed(B)));
           auto dst = (threadgroup \(memoryName(B))*)(threadgroup_block);
-          
+
           ushort D_src_dimension = min(
             ushort(\(blockDimensions.head)),
             ushort(\(headDimension) - d_outer));
@@ -246,29 +311,39 @@ extension AttentionKernel {
             ushort(C_src_dimension));
           ushort2 tile_src(D_src_dimension, C_src_dimension);
           ushort2 tile_dst(D_dst_dimension, C_dst_dimension);
-          
+
           simdgroup_event event;
           event.async_copy(
             dst, \(leadingBlockDimension(B)), tile_dst,
             src, \(leadingDimension(B)), tile_src, \(transposed(B)));
           simdgroup_event::wait(1, &event);
         }
-        
+
         \(declareRHSLocation(descriptor: descriptor))
-        
+
         """
       }
     }
     
     // MARK: - Inner Loop
-    
+
     func innerLoopTraversal(
       traversalStart: String,
       traversalEnd: String,
       descriptor: LoopIterationDescriptor
     ) -> String {
-      """
-      
+      // Check if B (RHS) is quantized and needs special loading
+      if isQuantizedLoad(B) {
+        return innerLoopTraversalQuantized(
+          traversalStart: traversalStart,
+          traversalEnd: traversalEnd,
+          descriptor: descriptor
+        )
+      }
+
+      // Standard non-quantized path
+      return """
+
       #pragma clang loop unroll(full)
       for (ushort c = \(traversalStart); c < \(traversalEnd); c += 8) {
         // Load the RHS from memory.
@@ -277,13 +352,131 @@ extension AttentionKernel {
         \(B).\(loadFunction(B))(
           \(B)_src, \(leadingDimensionRHS(descriptor)),
           \(B)_origin, \(!transposed(B)));
-        
+
         // Issue one SIMD matmul instruction.
         \(C)_sram[c / 8].multiply(
           \(A)_sram[(\(descriptor.registerOffset) + d) / 8],
           \(B), \(descriptor.accumulateConditional));
       }
-      
+
+      """
+    }
+
+    /// Quantized inner loop with on-the-fly dequantization
+    func innerLoopTraversalQuantized(
+      traversalStart: String,
+      traversalEnd: String,
+      descriptor: LoopIterationDescriptor
+    ) -> String {
+      guard let quantizedKV = self.quantizedKV else {
+        fatalError("Called quantized path without quantizedKV set")
+      }
+
+      // Generate the dequantization function name
+      let dequantFunc: String
+      switch quantizedKV {
+      case .FP8_E4M3:
+        dequantFunc = "fp8_e4m3_to_half"
+      case .FP8_E5M2:
+        dequantFunc = "fp8_e5m2_to_half"
+      case .INT8:
+        dequantFunc = "uint8_to_half_signed"
+      default:
+        // NF4 needs special handling (2 values per byte)
+        dequantFunc = "fp8_e4m3_to_half"  // Fallback
+      }
+
+      // Scale buffer name
+      let scaleBuffer = "\(B)_scale"
+
+      // IMPORTANT: The standard load uses !transposed(B), not transposed(B)
+      // If K is stored non-transposed (transposed(K) = false), we load with transpose=true
+      // This means the memory layout interpretation is INVERTED from the transpose flag
+      let loadTranspose = !transposed(B)
+
+      // Determine whether we're loading from device or threadgroup memory
+      let useThreadgroup = descriptor.addressSpaceRHS == .threadgroup
+
+      // For threadgroup: data is laid out as [seq, head] in threadgroup memory
+      // with leading dimension = leadingBlockDimension(B)
+      let leadingDim = useThreadgroup ? "\(leadingBlockDimension(B))" : "\(leadingDimension(B))"
+
+      // Base pointer depends on address space
+      let quantBaseDecl: String
+      if useThreadgroup {
+        quantBaseDecl = "threadgroup uchar* quant_base = \(B)_tg_base;"
+      } else {
+        quantBaseDecl = "device const uchar* quant_base = \(B);  // K is device const uchar*"
+      }
+
+      // For threadgroup: seq offset is relative to tile (starts at 0)
+      // For device: seq offset is absolute (needs K_seq_base)
+      let seqBaseExpr = useThreadgroup ? "0" : "\(B)_seq_base"
+      // For threadgroup: head offset is relative to tile (starts at 0)
+      // For device: head offset is absolute (needs d_outer)
+      let headBaseExpr = useThreadgroup ? "d" : "(d_outer + d)"
+
+      return """
+
+      #pragma clang loop unroll(full)
+      for (ushort c = \(traversalStart); c < \(traversalEnd); c += 8) {
+        simdgroup_matrix_storage<half> \(B)_tile;
+
+        // Load and dequantize 2 elements per thread
+        {
+          \(quantBaseDecl)
+          float scale_val = \(scaleBuffer)[0];
+
+          // For simdgroup_matrix_storage 8x8 tile:
+          // - morton_offset.x = column position in tile (0-7, step 2)
+          // - morton_offset.y = row position in tile (0-7)
+          // - Each thread loads 2 adjacent columns in the same row
+          //
+          // With loadTranspose=true (K not transposed in memory):
+          // - Tile columns map to memory rows (seq dimension)
+          // - Tile rows map to memory columns (head dimension)
+          // - So 2 adjacent elements are at adjacent seq positions, same head position
+          //
+          // K[seq, head] storage: address = seq * leadingDim + head
+
+          uint addr0, addr1;
+          if (\(loadTranspose)) {
+            // loadTranspose=true: tile columns = memory rows (seq), tile rows = memory cols (head)
+            // seq_pos = base + inner_c + morton_offset.x
+            // head_pos = head_base + morton_offset.y
+            uint seq_pos0 = \(seqBaseExpr) + c + morton_offset.x;
+            uint seq_pos1 = seq_pos0 + 1;
+            uint head_pos = \(headBaseExpr) + morton_offset.y;
+            addr0 = seq_pos0 * \(leadingDim) + head_pos;
+            addr1 = seq_pos1 * \(leadingDim) + head_pos;
+          } else {
+            // loadTranspose=false: tile columns = memory cols (head), tile rows = memory rows (seq)
+            // head_pos = base + inner_c + morton_offset.x
+            // seq_pos = head_base + morton_offset.y
+            uint head_pos0 = \(seqBaseExpr) + c + morton_offset.x;
+            uint head_pos1 = head_pos0 + 1;
+            uint seq_pos = \(headBaseExpr) + morton_offset.y;
+            addr0 = seq_pos * \(leadingDim) + head_pos0;
+            addr1 = seq_pos * \(leadingDim) + head_pos1;
+          }
+
+          uchar quant_val0 = quant_base[addr0];
+          uchar quant_val1 = quant_base[addr1];
+
+          half dequant0 = \(dequantFunc)(quant_val0, scale_val);
+          half dequant1 = \(dequantFunc)(quant_val1, scale_val);
+
+          // Store into simdgroup matrix storage
+          ((thread half*)\(B)_tile.thread_elements())[0] = dequant0;
+          ((thread half*)\(B)_tile.thread_elements())[1] = dequant1;
+        }
+
+        // Issue one SIMD matmul instruction.
+        \(C)_sram[c / 8].multiply(
+          \(A)_sram[(\(descriptor.registerOffset) + d) / 8],
+          \(B)_tile, \(descriptor.accumulateConditional));
+      }
+
       """
     }
     

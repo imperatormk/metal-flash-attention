@@ -26,9 +26,10 @@ extension AttentionKernel {
     \(createMetalSimdgroupEvent())
     \(createMetalSimdgroupMatrixStorage())
     using namespace metal;
-    
+
+    \(createQuantizationUtilities())
     \(createConstants())
-    
+
     // Declare the function.
     kernel void attention(
       \(createBufferBindings())
@@ -59,14 +60,35 @@ extension AttentionKernel {
 // MARK: - Function Signature
 
 extension AttentionKernel {
+  func createQuantizationUtilities() -> String {
+    // Only include quantization utilities if we have quantized K/V
+    guard let quantizedKV = self.quantizedKV, quantizedKV.isQuantized else {
+      return ""
+    }
+
+    // Include the appropriate dequantization functions based on the quantization type
+    switch quantizedKV {
+    case .FP8_E4M3:
+      return QuantizationUtilities.fp8E4M3ToFloat
+    case .FP8_E5M2:
+      return QuantizationUtilities.fp8E5M2ToFloat
+    case .INT8:
+      return QuantizationUtilities.int8ToHalf
+    case .NF4:
+      return QuantizationUtilities.nf4ToHalf
+    default:
+      return ""
+    }
+  }
+
   func createConstants() -> String {
     """
-    
+
     // R = row dimension (output sequence)
     // C = column dimension (input sequence)
     constant uint R [[function_constant(0)]];
     constant uint C [[function_constant(1)]];
-    
+
     """
   }
   
@@ -110,12 +132,26 @@ extension AttentionKernel {
         var line = "device const uchar* \(operand) "
         line += "[[buffer(\(operand.bufferBinding!))]],"
         output += "  " + line + "\n"
+      } else if (operand == .K || operand == .V), let quantizedKV = self.quantizedKV, quantizedKV.isQuantized {
+        // Quantized K/V use uchar* for the raw quantized data
+        var line = "device const uchar* \(operand) "
+        line += "[[buffer(\(operand.bufferBinding!))]],"
+        output += "  " + line + "\n"
       } else {
         var line = "device \(memoryName(operand))* \(operand) "
         line += "[[buffer(\(operand.bufferBinding!))]],"
         output += "  " + line + "\n"
       }
     }
+
+    // Add scale buffers for quantized K/V
+    if let quantizedKV = self.quantizedKV, quantizedKV.isQuantized {
+      // K_scale: per-head scale factors for K, shape [num_heads] or [batch, num_heads]
+      output += "  device const float* K_scale [[buffer(20)]],\n"
+      // V_scale: per-head scale factors for V, shape [num_heads] or [batch, num_heads]
+      output += "  device const float* V_scale [[buffer(21)]],\n"
+    }
+
     return output
   }
 }
@@ -184,17 +220,43 @@ extension AttentionKernel {
     accumulateDesc.B = .V
     accumulateDesc.C = .O
     accumulateDesc.everyIterationScale = "correction"
-    accumulateDesc.lastIterationScale = "fast::divide(1, l)"
+    // Clamp l to avoid division by zero when all positions are masked
+    accumulateDesc.lastIterationScale = "fast::divide(1, max(l, 1e-9f))"
     let PV = accumulate(descriptor: accumulateDesc)
-    
+
+    // Generate early exit condition for sliding window
+    // Skip KV blocks that are entirely outside the attention window for ALL rows in the Q block
+    // IMPORTANT: Never skip c=0 because the accumulator is initialized there
+    let slidingWindowEarlyExit: String
+    if let windowSize = windowSize, windowSize > 0 {
+      // The Q block covers rows [parallelization_group_offset, parallelization_group_offset + blockDimensions.parallelization)
+      // We can skip a KV block [c, c + traversal) if its END is before the window start of the MINIMUM row
+      slidingWindowEarlyExit = """
+
+      // Early exit: skip KV blocks entirely before the sliding window for all Q rows
+      // Never skip c=0 because that's where O accumulator is initialized
+      if (c > 0 && \(parallelizationGroupOffset) >= \(windowSize)) {
+        uint window_start_min_row = \(parallelizationGroupOffset) - \(windowSize);
+        if (c + \(blockDimensions.traversal) <= window_start_min_row) {
+          continue;
+        }
+      }
+
+"""
+    } else {
+      slidingWindowEarlyExit = ""
+    }
+
     return """
 
     // Outer loop over the traversal dimension.
     for (uint c = 0; c < C; c += \(blockDimensions.traversal)) {
+      \(slidingWindowEarlyExit)
       // S = Q * K^T
       \(QKT)
       \(maskAttentionMatrixEdge())
       \(maskCausal())
+      \(maskSlidingWindow())
       \(maskWithExternalMask())
 
       // m = reduce(m)
@@ -244,6 +306,7 @@ extension AttentionKernel {
       // S = Q * K^T
       \(QKT)
       \(maskCausal())
+      \(maskSlidingWindow())
       \(maskWithExternalMask())
 
       // P = softmax(S * scaleFactor)
@@ -294,6 +357,7 @@ extension AttentionKernel {
       // S^T = K * Q^T
       \(KQT)
       \(maskCausal())
+      \(maskSlidingWindow())
       \(maskWithExternalMask())
 
       // P^T = exp(S^T - L)
