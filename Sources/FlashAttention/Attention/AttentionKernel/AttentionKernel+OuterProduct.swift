@@ -254,6 +254,12 @@ extension AttentionKernel {
           // For quantized types, manually copy to threadgroup memory
           // Can't use async_copy/apply_offset since they're not specialized for uchar
           //
+          // NF4 is special: 2 values packed per byte along head dim
+          // So memory stride is D/2, not D
+          let isNF4 = (quantizedKV == .NF4)
+          let packedHeadDim = isNF4 ? "(\(headDimension) / 2)" : "\(headDimension)"
+          let packedBlockHead = isNF4 ? "(\(blockDimensions.head) / 2)" : "\(blockDimensions.head)"
+
           // We use ALL threads in simdgroup 0 to parallelize the copy
           // Each thread copies a subset of the data
           return """
@@ -264,22 +270,29 @@ extension AttentionKernel {
             device const uchar* src = \(B);
             threadgroup uchar* dst = (threadgroup uchar*)(threadgroup_block);
 
+            // For NF4: D_dimension is in packed bytes (D/2), not logical elements
             ushort D_dimension = min(
-              ushort(\(blockDimensions.head)),
-              ushort(\(headDimension) - d_outer));
+              ushort(\(packedBlockHead)),
+              ushort(\(packedHeadDim) - d_outer / 2));
             ushort C_dimension = min(
               uint(\(blockDimensions.traversal)),
               uint(\(traversalDimension) - \(traversalOffset)));
 
             // Copy tile: K[traversalOffset..+C_dimension, d_outer..+D_dimension]
-            // Storage is K[seq, head], so address = seq * headDim + head
+            // For NF4: memory stride is D/2 (packed bytes)
+            // For FP8/INT8: memory stride is D (1 byte per element)
+            uint src_stride = \(packedHeadDim);
+            ushort dst_stride = \(packedBlockHead);
+
             // Parallelize across all 32 threads in the simdgroup
-            ushort total_elements = C_dimension * D_dimension;
-            for (ushort i = lane_id; i < total_elements; i += 32) {
+            ushort total_bytes = C_dimension * D_dimension;
+            for (ushort i = lane_id; i < total_bytes; i += 32) {
               ushort seq = i / D_dimension;
-              ushort head = i % D_dimension;
-              uint src_addr = (\(traversalOffset) + seq) * \(leadingDimension(B)) + (d_outer + head);
-              uint dst_addr = seq * \(leadingBlockDimension(B)) + head;
+              ushort byte_col = i % D_dimension;
+              // For NF4: d_outer is in logical head units, convert to packed byte offset
+              uint src_byte_col = \(isNF4 ? "(d_outer / 2) + byte_col" : "d_outer + byte_col");
+              uint src_addr = (\(traversalOffset) + seq) * src_stride + src_byte_col;
+              uint dst_addr = seq * dst_stride + byte_col;
               dst[dst_addr] = src[src_addr];
             }
           }
@@ -372,6 +385,15 @@ extension AttentionKernel {
         fatalError("Called quantized path without quantizedKV set")
       }
 
+      // NF4 needs special handling (2 values per byte)
+      if quantizedKV == .NF4 {
+        return innerLoopTraversalQuantizedNF4(
+          traversalStart: traversalStart,
+          traversalEnd: traversalEnd,
+          descriptor: descriptor
+        )
+      }
+
       // Generate the dequantization function name
       let dequantFunc: String
       switch quantizedKV {
@@ -382,8 +404,7 @@ extension AttentionKernel {
       case .INT8:
         dequantFunc = "uint8_to_half_signed"
       default:
-        // NF4 needs special handling (2 values per byte)
-        dequantFunc = "fp8_e4m3_to_half"  // Fallback
+        dequantFunc = "fp8_e4m3_to_half"
       }
 
       // Scale buffer name
@@ -479,7 +500,118 @@ extension AttentionKernel {
 
       """
     }
-    
+
+    /// NF4 quantized inner loop - special handling for 2 values per byte
+    ///
+    /// NF4 packs 2 values per byte along the HEAD DIMENSION (D):
+    /// - Python stores K/V as (B, H, N, D//2) uint8
+    /// - Low nibble = even D index, high nibble = odd D index
+    /// - Memory layout: K[seq, packed_head] where packed_head = D//2
+    /// - byte_addr = seq * (D//2) + (head // 2)
+    /// - nibble = (head % 2 == 0) ? low : high
+    func innerLoopTraversalQuantizedNF4(
+      traversalStart: String,
+      traversalEnd: String,
+      descriptor: LoopIterationDescriptor
+    ) -> String {
+      let scaleBuffer = "\(B)_scale"
+      let loadTranspose = !transposed(B)
+      let useThreadgroup = descriptor.addressSpaceRHS == .threadgroup
+
+      // NF4 packed stride = D/2 (NOT the regular leadingDimension which is D)
+      // For threadgroup: we only copied the tile, so stride is blockDimensions.head/2
+      // For device: stride is full headDimension/2
+      let packedStride = useThreadgroup ? "\(blockDimensions.head / 2)" : "(\(headDimension) / 2)"
+
+      let quantBaseDecl: String
+      if useThreadgroup {
+        quantBaseDecl = "threadgroup uchar* quant_base = \(B)_tg_base;"
+      } else {
+        quantBaseDecl = "device const uchar* quant_base = \(B);"
+      }
+
+      // Seq base: for device memory, use saved outer loop value; for threadgroup, start at 0
+      let seqBaseExpr = useThreadgroup ? "0" : "\(B)_seq_base"
+      // Head base: for device memory, use d_outer + d; for threadgroup, just d (relative to tile)
+      let headBaseExpr = useThreadgroup ? "d" : "(d_outer + d)"
+
+      return """
+
+      #pragma clang loop unroll(full)
+      for (ushort c = \(traversalStart); c < \(traversalEnd); c += 8) {
+        simdgroup_matrix_storage<half> \(B)_tile;
+
+        // NF4: 2 values packed per byte along HEAD dimension
+        // Memory: K[seq, packed_head] with packed_head = D//2
+        // byte_addr = seq * (D/2) + (head / 2)
+        // nibble = low if head%2==0, high if head%2==1
+        {
+          \(quantBaseDecl)
+          float scale_val = \(scaleBuffer)[0];
+          uint packed_stride = \(packedStride);
+
+          // simdgroup_matrix_storage 8x8 tile mapping:
+          // - morton_offset.x = column within tile (0,2,4,6 - each thread handles 2 cols)
+          // - morton_offset.y = row within tile (0-7)
+          // - Each thread loads 2 adjacent COLUMNS at the same row
+
+          if (\(loadTranspose)) {
+            // loadTranspose=true (typical for K in Q@K^T):
+            // tile columns -> seq positions (traversal dim)
+            // tile rows -> head positions
+            // So 2 adjacent tile columns = 2 adjacent seq positions, same head
+            uint seq0 = \(seqBaseExpr) + c + morton_offset.x;
+            uint seq1 = seq0 + 1;
+            uint head = \(headBaseExpr) + morton_offset.y;
+
+            // Both values at same head position but different seq
+            // They're in different bytes (different seq rows)
+            uint byte0 = seq0 * packed_stride + (head / 2);
+            uint byte1 = seq1 * packed_stride + (head / 2);
+
+            uchar packed0 = quant_base[byte0];
+            uchar packed1 = quant_base[byte1];
+
+            // Same nibble position in both bytes (determined by head)
+            bool high = (head & 1) != 0;
+            half val0 = nf4_to_half(packed0, high, scale_val);
+            half val1 = nf4_to_half(packed1, high, scale_val);
+
+            ((thread half*)\(B)_tile.thread_elements())[0] = val0;
+            ((thread half*)\(B)_tile.thread_elements())[1] = val1;
+          } else {
+            // loadTranspose=false:
+            // tile columns -> head positions
+            // tile rows -> seq positions
+            // So 2 adjacent tile columns = 2 adjacent head positions, same seq
+            uint head0 = \(seqBaseExpr) + c + morton_offset.x;
+            uint head1 = head0 + 1;
+            uint seq = \(headBaseExpr) + morton_offset.y;
+
+            // 2 adjacent heads at same seq - may be in same byte or adjacent bytes
+            uint byte0 = seq * packed_stride + (head0 / 2);
+            uint byte1 = seq * packed_stride + (head1 / 2);
+
+            uchar packed0 = quant_base[byte0];
+            uchar packed1 = quant_base[byte1];
+
+            // Different nibbles based on head position
+            half val0 = nf4_to_half(packed0, (head0 & 1) != 0, scale_val);
+            half val1 = nf4_to_half(packed1, (head1 & 1) != 0, scale_val);
+
+            ((thread half*)\(B)_tile.thread_elements())[0] = val0;
+            ((thread half*)\(B)_tile.thread_elements())[1] = val1;
+          }
+        }
+
+        \(C)_sram[c / 8].multiply(
+          \(A)_sram[(\(descriptor.registerOffset) + d) / 8],
+          \(B)_tile, \(descriptor.accumulateConditional));
+      }
+
+      """
+    }
+
     func innerLoopHead(
       descriptor: LoopIterationDescriptor
     ) -> String {
