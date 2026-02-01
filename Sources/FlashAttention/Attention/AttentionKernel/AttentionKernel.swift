@@ -30,6 +30,12 @@ public struct AttentionKernel {
   // External attention mask
   var hasMask: Bool
 
+  // Additive attention bias
+  var hasAttnBias: Bool
+  var biasBatchStride: UInt32
+  var biasHeadStride: UInt32
+  var biasRepeatCount: UInt32
+
   // Sliding window attention size (nil or 0 = full attention)
   var windowSize: UInt32?
 
@@ -57,6 +63,10 @@ public struct AttentionKernel {
     self.headDimension = headDimension
     self.causal = descriptor.causal
     self.hasMask = descriptor.hasMask
+    self.hasAttnBias = descriptor.hasAttnBias
+    self.biasBatchStride = descriptor.biasBatchStride
+    self.biasHeadStride = descriptor.biasHeadStride
+    self.biasRepeatCount = descriptor.biasRepeatCount
     self.windowSize = descriptor.windowSize
     self.quantizedKV = descriptor.quantizedKV
 

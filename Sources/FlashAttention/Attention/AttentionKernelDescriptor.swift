@@ -49,6 +49,20 @@ public struct AttentionKernelDescriptor {
   /// External attention mask - when true, expects a boolean mask buffer
   public var hasMask: Bool = false
 
+  /// Additive attention bias - when true, expects a float bias buffer
+  /// Used for relative position bias in Swin Transformer, ALiBi, etc.
+  public var hasAttnBias: Bool = false
+
+  /// Strides for attention bias broadcasting
+  /// biasBatchStride: 0 = broadcast across batch, else stride for batch dim
+  /// biasHeadStride: 0 = broadcast across heads, else stride for head dim
+  public var biasBatchStride: UInt32 = 0
+  public var biasHeadStride: UInt32 = 0
+
+  /// Number of unique bias patterns that repeat across batch
+  /// 0 = no repeat, >0 = pattern repeats (batch_idx % biasRepeatCount gives pattern index)
+  public var biasRepeatCount: UInt32 = 0
+
   /// Sliding window attention size - if set, each token only attends to windowSize previous tokens
   /// This enables efficient attention for models like Mistral and Llama 3.2
   /// nil = full attention (default), 0 = full attention, >0 = sliding window of that size

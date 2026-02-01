@@ -26,7 +26,15 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
 
   // External attention mask (boolean, true = attend, false = mask out)
   case mask
-  
+
+  // Additive attention bias (float, added to attention scores before softmax)
+  // Shape: [batch, num_heads, seq_q, seq_k] or broadcastable
+  case attnBias
+
+  // Second additive mask (float, for window masks etc.)
+  // Shape: [nW, seq_q, seq_k] or similar - encoder handles offsets
+  case attnMask2
+
   /// The name in the shader source.
   ///
   /// Since the `AttentionOperand` type conforms to `CustomStringConvertible`,
@@ -50,6 +58,8 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
     case .dK: return "dK"
     case .dQ: return "dQ"
     case .mask: return "mask"
+    case .attnBias: return "attn_bias"
+    case .attnMask2: return "attn_mask2"
     }
   }
   
@@ -72,6 +82,8 @@ public enum AttentionOperand: Hashable, Equatable, CustomStringConvertible {
     case .dK: return 8
     case .dQ: return 9
     case .mask: return 10
+    case .attnBias: return 11
+    case .attnMask2: return 12
     }
   }
 }

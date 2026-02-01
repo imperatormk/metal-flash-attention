@@ -34,6 +34,23 @@ public struct AttentionDescriptor {
   // Mask shape: [seq_q, seq_k] where true = attend, false = mask out (-inf)
   public var hasMask: Bool = false
 
+  // Additive attention bias - when true, expects a float bias buffer
+  // Shape: [batch, num_heads, seq_q, seq_k] - added to attention scores before softmax
+  // This is used for relative position bias in Swin Transformer, ALiBi, etc.
+  public var hasAttnBias: Bool = false
+
+  // Stride for attention bias batch dimension (0 = broadcast across batch)
+  // If > 0, bias is indexed as: bias[batch_idx * biasBatchStride + head * seq_q * seq_k + ...]
+  public var biasBatchStride: UInt32 = 0
+
+  // Stride for attention bias head dimension (0 = broadcast across heads)
+  public var biasHeadStride: UInt32 = 0
+
+  // Number of unique bias patterns that repeat across batch dimension
+  // 0 = no repeat (use biasBatchStride), >0 = bias pattern repeats every biasRepeatCount batches
+  // Used for window attention where nW window patterns repeat for batch_per_window images
+  public var biasRepeatCount: UInt32 = 0
+
   // Sliding window attention - each token only attends to windowSize previous tokens
   // nil or 0 = full attention (default), >0 = sliding window of that size
   // Used by Mistral, Llama 3.2, and other efficient attention models
@@ -159,6 +176,10 @@ extension AttentionDescriptor {
     output.type = type
     output.causal = causal
     output.hasMask = hasMask
+    output.hasAttnBias = hasAttnBias
+    output.biasBatchStride = biasBatchStride
+    output.biasHeadStride = biasHeadStride
+    output.biasRepeatCount = biasRepeatCount
     output.windowSize = windowSize
     output.quantizedKV = quantizedKV
 

@@ -765,7 +765,84 @@ extension AttentionKernel {
         \(declareOperandLocation(addressSpace: .threadgroup))
         \(innerLoop())
       }
-      
+
+      """
+    }
+  }
+
+  // Add attention bias to attention scores
+  // Bias buffer is pre-offset by the encoder to point to the correct [seq_q, seq_k] slice
+  // for the current batch/head. Kernel just adds bias[row_idx, col_idx] to S.
+  func addAttnBias() -> String {
+    guard hasAttnBias else { return "" }
+
+    let blockDim = blockDimensions.traversal
+
+    switch type {
+    case .forward, .backwardQuery:
+      // row = parallelization position (Q position), col = traversal position (KV position)
+      return """
+
+      // Add attention bias
+      {
+        // Current row position (Q position within the sequence)
+        uint row_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort c_block = 0; c_block < \(blockDim); c_block += 8) {
+          // Column position (KV position within the sequence)
+          uint col_base = \(traversalOffset) + c_block;
+
+          auto S_elements = S_sram[c_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint col_idx = col_base + morton_offset.x + index;
+            // Check bounds
+            if (row_idx < R && col_idx < C) {
+              // Bias buffer is pre-offset by encoder - just index [row, col]
+              uint bias_idx = row_idx * C + col_idx;
+              \(registerName(.S)) bias_val = attn_bias[bias_idx];
+              (*S_elements)[index] += bias_val;
+            }
+          }
+        }
+      }
+
+      """
+
+    case .backwardKeyValue:
+      // In backwardKeyValue, we compute S^T = K * Q^T
+      // parallelization = KV position, traversal = Q position
+      return """
+
+      // Add attention bias (transposed access for backward KV)
+      {
+        // Current KV position (parallelization dimension)
+        uint kv_idx = \(parallelizationGroupOffset) + sidx * 8 + morton_offset.y;
+
+        #pragma clang loop unroll(full)
+        for (ushort r_block = 0; r_block < \(blockDim); r_block += 8) {
+          // Q position (traversal dimension)
+          uint q_base = \(traversalOffset) + r_block;
+
+          auto S_elements = S_sram[r_block / 8].thread_elements();
+
+          #pragma clang loop unroll(full)
+          for (ushort index = 0; index < 2; ++index) {
+            uint q_idx = q_base + morton_offset.x + index;
+            // Check bounds
+            if (kv_idx < C && q_idx < R) {
+              // For S^T[kv, q], we need bias[q, kv]
+              // Bias buffer is pre-offset by encoder
+              uint bias_idx = q_idx * C + kv_idx;
+              \(registerName(.S)) bias_val = attn_bias[bias_idx];
+              (*S_elements)[index] += bias_val;
+            }
+          }
+        }
+      }
+
       """
     }
   }

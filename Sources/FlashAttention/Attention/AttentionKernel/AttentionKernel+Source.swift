@@ -106,6 +106,9 @@ extension AttentionKernel {
       if hasMask {
         operands += [.mask]
       }
+      if hasAttnBias {
+        operands += [.attnBias]
+      }
     case .backwardQuery:
       operands += [.Q, .K, .V, .O]
       operands += [.dO, .dQ]
@@ -113,12 +116,18 @@ extension AttentionKernel {
       if hasMask {
         operands += [.mask]
       }
+      if hasAttnBias {
+        operands += [.attnBias]
+      }
     case .backwardKeyValue:
       operands += [.Q, .K, .V]
       operands += [.dO, .dV, .dK]
       operands += [.L, .D]
       if hasMask {
         operands += [.mask]
+      }
+      if hasAttnBias {
+        operands += [.attnBias]
       }
     }
     operands.sort {
@@ -130,6 +139,11 @@ extension AttentionKernel {
       if operand == .mask {
         // Mask is boolean (stored as uchar for Metal compatibility)
         var line = "device const uchar* \(operand) "
+        line += "[[buffer(\(operand.bufferBinding!))]],"
+        output += "  " + line + "\n"
+      } else if operand == .attnBias {
+        // Attention bias is float (same precision as S)
+        var line = "device const \(registerName(.S))* \(operand) "
         line += "[[buffer(\(operand.bufferBinding!))]],"
         output += "  " + line + "\n"
       } else if (operand == .K || operand == .V), let quantizedKV = self.quantizedKV, quantizedKV.isQuantized {
@@ -258,6 +272,7 @@ extension AttentionKernel {
       \(maskCausal())
       \(maskSlidingWindow())
       \(maskWithExternalMask())
+      \(addAttnBias())
 
       // m = reduce(m)
       \(onlineReduceMaximum())
@@ -308,6 +323,7 @@ extension AttentionKernel {
       \(maskCausal())
       \(maskSlidingWindow())
       \(maskWithExternalMask())
+      \(addAttnBias())
 
       // P = softmax(S * scaleFactor)
       \(softmax(derivative: false))
@@ -359,6 +375,7 @@ extension AttentionKernel {
       \(maskCausal())
       \(maskSlidingWindow())
       \(maskWithExternalMask())
+      \(addAttnBias())
 
       // P^T = exp(S^T - L)
       \(softmax(derivative: false))
