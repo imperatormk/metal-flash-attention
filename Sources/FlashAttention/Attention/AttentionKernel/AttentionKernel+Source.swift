@@ -30,30 +30,103 @@ extension AttentionKernel {
     \(createQuantizationUtilities())
     \(createConstants())
 
+    // Batched dispatch uniform buffer (passed at runtime, not baked into pipeline)
+    // This struct holds per-head strides for buffer indexing
+    struct BatchedParams {
+      uint num_heads;
+      uint Q_head_stride;
+      uint K_head_stride;
+      uint V_head_stride;
+      uint O_head_stride;
+      uint L_head_stride;
+      uint mask_head_stride;
+    };
+
     // Declare the function.
     kernel void attention(
       \(createBufferBindings())
+      constant BatchedParams& batched_params [[buffer(30)]],
       threadgroup uchar *threadgroup_block [[threadgroup(0)]],
-      
-      uint gid [[threadgroup_position_in_grid]],
+
+      uint3 gid [[threadgroup_position_in_grid]],
       ushort sidx [[simdgroup_index_in_threadgroup]],
       ushort lane_id [[thread_index_in_simdgroup]]
     ) {
       ushort2 morton_offset = morton_order(lane_id);
-      uint parallelization_group_offset = gid;
+
+      // gid.x = block within sequence, gid.y = head index, gid.z = batch index
+      uint parallelization_group_offset = gid.x;
       parallelization_group_offset *= \(blockDimensions.parallelization);
-      
+
+      // Compute buffer offsets for this batch/head (in elements)
+      uint batch_head_idx = gid.z * batched_params.num_heads + gid.y;
+
+      // Offset all buffer pointers for batched dispatch
+      \(createBatchedPointerOffsets())
+
       // Return early if the entire SIMD is out of bounds.
       if (\(parallelizationGroupOffset) >= \(parallelizationDimension)) {
         return;
       }
-      
+
       \(createSetup())
       \(createLoop())
       \(createCleanup(type: type))
     }
-    
+
     """
+  }
+}
+
+// MARK: - Batched Dispatch
+
+extension AttentionKernel {
+  /// Creates pointer offset code for batched dispatch
+  /// This offsets all buffer pointers by (batch * num_heads + head) * stride
+  func createBatchedPointerOffsets() -> String {
+    // Determine which operands need offsetting based on kernel type
+    var offsets: [String] = []
+
+    switch type {
+    case .forward:
+      offsets.append("Q += batch_head_idx * batched_params.Q_head_stride;")
+      offsets.append("K += batch_head_idx * batched_params.K_head_stride;")
+      offsets.append("V += batch_head_idx * batched_params.V_head_stride;")
+      offsets.append("O += batch_head_idx * batched_params.O_head_stride;")
+      offsets.append("L += batch_head_idx * batched_params.L_head_stride;")
+      if hasMask {
+        offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
+      }
+      // Note: attn_bias handled separately with its own stride logic
+
+    case .backwardQuery:
+      offsets.append("Q += batch_head_idx * batched_params.Q_head_stride;")
+      offsets.append("K += batch_head_idx * batched_params.K_head_stride;")
+      offsets.append("V += batch_head_idx * batched_params.V_head_stride;")
+      offsets.append("O += batch_head_idx * batched_params.O_head_stride;")
+      offsets.append("L += batch_head_idx * batched_params.L_head_stride;")
+      offsets.append("D += batch_head_idx * batched_params.L_head_stride;")  // D has same stride as L
+      offsets.append("dO += batch_head_idx * batched_params.O_head_stride;")
+      offsets.append("dQ += batch_head_idx * batched_params.Q_head_stride;")
+      if hasMask {
+        offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
+      }
+
+    case .backwardKeyValue:
+      offsets.append("Q += batch_head_idx * batched_params.Q_head_stride;")
+      offsets.append("K += batch_head_idx * batched_params.K_head_stride;")
+      offsets.append("V += batch_head_idx * batched_params.V_head_stride;")
+      offsets.append("L += batch_head_idx * batched_params.L_head_stride;")
+      offsets.append("D += batch_head_idx * batched_params.L_head_stride;")
+      offsets.append("dO += batch_head_idx * batched_params.O_head_stride;")
+      offsets.append("dK += batch_head_idx * batched_params.K_head_stride;")
+      offsets.append("dV += batch_head_idx * batched_params.V_head_stride;")
+      if hasMask {
+        offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
+      }
+    }
+
+    return offsets.joined(separator: "\n      ")
   }
 }
 

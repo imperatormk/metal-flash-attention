@@ -446,7 +446,7 @@ extension AttentionKernel {
         // Load and dequantize 2 elements per thread
         {
           \(quantBaseDecl)
-          float scale_val = \(scaleBuffer)[0];
+          float scale_val = \(scaleBuffer)[batch_head_idx];
 
           // For simdgroup_matrix_storage 8x8 tile:
           // - morton_offset.x = column position in tile (0-7, step 2)
@@ -547,7 +547,7 @@ extension AttentionKernel {
         // nibble = low if head%2==0, high if head%2==1
         {
           \(quantBaseDecl)
-          float scale_val = \(scaleBuffer)[0];
+          float scale_val = \(scaleBuffer)[batch_head_idx];
           uint packed_stride = \(packedStride);
 
           // simdgroup_matrix_storage 8x8 tile mapping:

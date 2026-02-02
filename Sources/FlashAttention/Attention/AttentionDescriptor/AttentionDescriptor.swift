@@ -197,7 +197,7 @@ extension AttentionDescriptor {
     guard let matrixDimensions = self.matrixDimensions else {
       fatalError("Descriptor was incomplete.")
     }
-    
+
     var rowDimension = matrixDimensions.row
     var columnDimension = matrixDimensions.column
     constants.setConstantValue(&rowDimension, type: .uint, index: 0)
