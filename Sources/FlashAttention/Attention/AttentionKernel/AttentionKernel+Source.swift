@@ -97,7 +97,9 @@ extension AttentionKernel {
       if hasMask {
         offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
       }
-      // Note: attn_bias handled separately with its own stride logic
+      if hasAttnBias {
+        offsets.append(createAttnBiasOffset())
+      }
 
     case .backwardQuery:
       offsets.append("Q += batch_head_idx * batched_params.Q_head_stride;")
@@ -110,6 +112,9 @@ extension AttentionKernel {
       offsets.append("dQ += batch_head_idx * batched_params.Q_head_stride;")
       if hasMask {
         offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
+      }
+      if hasAttnBias {
+        offsets.append(createAttnBiasOffset())
       }
 
     case .backwardKeyValue:
@@ -124,9 +129,41 @@ extension AttentionKernel {
       if hasMask {
         offsets.append("mask += batch_head_idx * batched_params.mask_head_stride;")
       }
+      if hasAttnBias {
+        offsets.append(createAttnBiasOffset())
+      }
     }
 
     return offsets.joined(separator: "\n      ")
+  }
+
+  /// Create attention bias offset code for batched dispatch
+  /// Handles both regular bias (biasBatchStride > 0) and repeating bias (biasRepeatCount > 0)
+  func createAttnBiasOffset() -> String {
+    // biasRepeatCount > 0: pattern repeats every N batches (for window attention)
+    // Otherwise: use biasBatchStride for regular batch indexing
+    if biasRepeatCount > 0 {
+      // bias_pattern_idx = batch_idx % repeat_count
+      // offset = pattern_idx * num_heads * head_stride + head_idx * head_stride
+      // Simplified: offset = (pattern_idx * num_heads + head_idx) * head_stride
+      return "attn_bias += ((gid.z % \(biasRepeatCount)) * batched_params.num_heads + gid.y) * \(biasHeadStride);"
+    } else if biasBatchStride > 0 || biasHeadStride > 0 {
+      // Regular case: offset = batch * batch_stride + head * head_stride
+      var parts: [String] = []
+      if biasBatchStride > 0 {
+        parts.append("gid.z * \(biasBatchStride)")
+      }
+      if biasHeadStride > 0 {
+        parts.append("gid.y * \(biasHeadStride)")
+      }
+      if parts.isEmpty {
+        return "// attn_bias: broadcast across both batch and head"
+      }
+      return "attn_bias += \(parts.joined(separator: " + "));"
+    } else {
+      // Both strides are 0 - bias is broadcast across all batch/heads
+      return "// attn_bias: broadcast across batch and head (stride=0)"
+    }
   }
 }
 
