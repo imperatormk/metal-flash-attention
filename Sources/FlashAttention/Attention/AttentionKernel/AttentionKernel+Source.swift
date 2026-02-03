@@ -140,13 +140,24 @@ extension AttentionKernel {
   /// Create attention bias offset code for batched dispatch
   /// Handles both regular bias (biasBatchStride > 0) and repeating bias (biasRepeatCount > 0)
   func createAttnBiasOffset() -> String {
-    // biasRepeatCount > 0: pattern repeats every N batches (for window attention)
-    // Otherwise: use biasBatchStride for regular batch indexing
-    if biasRepeatCount > 0 {
+    // biasRepeatCount > 0 WITH biasBatchStride > 0: bias has multiple patterns that repeat
+    // biasRepeatCount > 0 WITH biasBatchStride = 0: single bias pattern broadcast to all batches
+    // biasBatchStride > 0 alone: regular per-batch bias
+
+    if biasRepeatCount > 0 && biasBatchStride > 0 {
+      // Multiple bias patterns that repeat every N batches
       // bias_pattern_idx = batch_idx % repeat_count
-      // offset = pattern_idx * num_heads * head_stride + head_idx * head_stride
-      // Simplified: offset = (pattern_idx * num_heads + head_idx) * head_stride
-      return "attn_bias += ((gid.z % \(biasRepeatCount)) * batched_params.num_heads + gid.y) * \(biasHeadStride);"
+      // offset = pattern_idx * batch_stride + head_idx * head_stride
+      // Note: batch_stride here is the stride between patterns (= num_heads * head_stride typically)
+      return "attn_bias += (gid.z % \(biasRepeatCount)) * \(biasBatchStride) + gid.y * \(biasHeadStride);"
+    } else if biasRepeatCount > 0 && biasBatchStride == 0 {
+      // Single bias pattern (batch_size=1) broadcast to all batches
+      // Only offset by head, ignore batch index entirely
+      if biasHeadStride > 0 {
+        return "attn_bias += gid.y * \(biasHeadStride);"
+      } else {
+        return "// attn_bias: single pattern broadcast to all batches and heads"
+      }
     } else if biasBatchStride > 0 || biasHeadStride > 0 {
       // Regular case: offset = batch * batch_stride + head * head_stride
       var parts: [String] = []
