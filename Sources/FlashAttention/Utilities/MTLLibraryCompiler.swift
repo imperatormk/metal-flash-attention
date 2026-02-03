@@ -2,7 +2,7 @@
 //  MTLLibraryCompiler.swift
 //  FlashAttention
 //
-//  Created for macOS 15+ compatibility.
+//  Created for macOS 15+ (Sequoia/Tahoe) compatibility.
 //
 
 import Foundation
@@ -11,11 +11,12 @@ import Metal
 /// Compiles Metal shader source code to an MTLLibrary.
 ///
 /// On macOS 15 (Sequoia) and later, Apple restricted the use of `__asm` directives
-/// in runtime-compiled Metal shaders. This affects the simdgroup async copy intrinsics
-/// used by FlashAttention for optimal performance.
+/// in runtime-compiled Metal shaders. On macOS 26 (Tahoe), even the CLI compiler
+/// rejects `__asm` with the default Metal 3.x standard.
 ///
-/// This compiler automatically detects the failure and falls back to using the
-/// command-line `xcrun metal` toolchain, which still supports these intrinsics.
+/// The solution is to compile with `-std=macos-metal2.4` which still allows `__asm`
+/// directives for simdgroup async copy intrinsics, while generating code compatible
+/// with all Apple Silicon GPUs.
 public struct MTLLibraryCompiler {
 
     /// Error types for library compilation
@@ -43,7 +44,7 @@ public struct MTLLibraryCompiler {
     ///
     /// First attempts runtime compilation via `MTLDevice.makeLibrary(source:)`.
     /// If that fails (e.g., due to `__asm` restrictions on macOS 15+), falls back
-    /// to using the command-line Metal compiler.
+    /// to using the command-line Metal compiler with `-std=macos-metal2.4`.
     ///
     /// - Parameters:
     ///   - source: The Metal shader source code
@@ -64,7 +65,7 @@ public struct MTLLibraryCompiler {
             let errorString = String(describing: runtimeError)
             if errorString.contains("illegal string literal in 'asm'") ||
                errorString.contains("__metal_simdgroup_async_copy") {
-                // Fall back to CLI compilation
+                // Fall back to CLI compilation with Metal 2.4 standard
                 return try makeLibraryViaCLI(source: source, device: device)
             } else {
                 // Some other error, re-throw
@@ -75,8 +76,14 @@ public struct MTLLibraryCompiler {
 
     /// Compile Metal source using the command-line toolchain.
     ///
-    /// This method writes the source to a temp file, compiles it with `xcrun metal`,
-    /// links it with `xcrun metallib`, and loads the result.
+    /// This method writes the source to a temp file, compiles it with `xcrun metal`
+    /// using `-std=macos-metal2.4` to enable `__asm` directives for simdgroup async
+    /// copy intrinsics, then links and loads the result.
+    ///
+    /// The Metal 2.4 standard is used because:
+    /// - It allows `__asm("air.simdgroup_async_copy_*")` intrinsics
+    /// - It generates code compatible with all Apple Silicon GPUs (M1-M4+)
+    /// - It works on macOS 12+ including Sequoia (15) and Tahoe (26)
     private static func makeLibraryViaCLI(
         source: String,
         device: MTLDevice
@@ -103,8 +110,9 @@ public struct MTLLibraryCompiler {
             throw CompilerError.tempFileCreationFailed
         }
 
-        // Compile to AIR
-        let compileResult = shell("xcrun metal -c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
+        // Compile to AIR using Metal 2.4 standard (allows __asm for simdgroup async copy)
+        // The -std=macos-metal2.4 flag is critical for macOS 26 (Tahoe) compatibility
+        let compileResult = shell("xcrun -sdk macosx metal -std=macos-metal2.4 -c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
         if compileResult.status != 0 {
             throw CompilerError.cliCompilationFailed(
                 "metal compile failed: \(compileResult.output)"
@@ -112,7 +120,7 @@ public struct MTLLibraryCompiler {
         }
 
         // Link to metallib
-        let linkResult = shell("xcrun metallib '\(airFile.path)' -o '\(metallibFile.path)' 2>&1")
+        let linkResult = shell("xcrun -sdk macosx metallib '\(airFile.path)' -o '\(metallibFile.path)' 2>&1")
         if linkResult.status != 0 {
             throw CompilerError.cliCompilationFailed(
                 "metallib link failed: \(linkResult.output)"
