@@ -12,7 +12,7 @@ Analyzed thoroughly, not worth it:
 
 Phase 2 (caching layer) was the real win — runs once per kernel, not per-iteration.
 
-## Known Debt (not ours, not worth fixing)
+## Known Debt
 
 ### loadPreviousC race in GEMM
 Pre-existing bug with shifted edge blocks. Not caused by reverse-linking.
