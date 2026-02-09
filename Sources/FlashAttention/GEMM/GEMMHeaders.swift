@@ -5,251 +5,366 @@
 //  Created by Philip Turner on 6/21/24.
 //
 
-/// Create the source code for the 'metal\_simdgroup\_event' header.
+/// Create the source code for the reverse-linking async copy protocol.
 ///
-/// I may have found the hardware bug with async copies on M1. If you shoot
-/// off an async copy, you need to read from its contents later in the
-/// the shader. Otherwise, something inside the hardware (like a
-/// DispatchSemaphore) will be waiting indefinitely to be notified. The bug
-/// is a bit flaky, and only shows up for certain problem configurations. The
-/// side effects are catastrophic; the GPU might freeze up until the computer
-/// reboots.
+/// Instead of using __asm("air.simdgroup_async_copy...") intrinsics (which
+/// are broken on Xcode 26.2+), the visible function writes async copy
+/// parameters to a command area in threadgroup memory. The pre-compiled IR
+/// kernel shell reads these params and executes the async copy intrinsics.
 ///
-/// Workaround: if an async copy from device -> threadgroup is launched,
-/// guarantee that both:
-/// - The threadgroup will enter another `threadgroup_barrier` before the end of
-///   the kernel.
-/// - The results of the async copy will be read from. This means at least one
-///   thread must dereference a pointer within the region of threadgroup memory.
-func createMetalSimdgroupEvent() -> String {
-  // Return the source string.
+/// TG Command Area Layout (first 128 bytes = 32 x uint32):
+///   cmd[0]  = command code: 0=done, 1=dual A+B copy, 2=single dev→TG, 3=single TG→dev
+///   cmd[1]  = A dst_elements_per_row
+///   cmd[2]  = A src_elements_per_row
+///   cmd[3]  = A src_tile_w
+///   cmd[4]  = A src_tile_h
+///   cmd[5]  = A src_byte_offset_lo
+///   cmd[6]  = A src_byte_offset_hi
+///   cmd[7]  = A tg_byte_offset
+///   cmd[8..10] = reserved
+///   cmd[11] = B dst_elements_per_row
+///   cmd[12] = B src_elements_per_row
+///   cmd[13] = B src_tile_w
+///   cmd[14] = B src_tile_h
+///   cmd[15] = B src_byte_offset_lo
+///   cmd[16] = B src_byte_offset_hi
+///   cmd[17] = B tg_byte_offset
+///   cmd[18..20] = reserved
+///   cmd[21] = A dst_tile_w
+///   cmd[22] = A dst_tile_h
+///   cmd[23] = B dst_tile_w
+///   cmd[24] = B dst_tile_h
+///   cmd[25] = gid_y (written by shell)
+///   cmd[26] = gid_z (written by shell)
+func createReverseLinkingProtocol() -> String {
   return """
 // -*- Metal -*-
-//===-- metal_simdgroup_event ---------------------------------------------===//
-// Copyright (c) 2024 Philip Turner. See MIT LICENSE
+//===-- reverse_linking_protocol ------------------------------------------===//
+// Async copy via pre-compiled IR shell + JIT visible functions.
+// The visible function writes copy params to TG cmd area; the shell executes.
 //===----------------------------------------------------------------------===//
 
-#ifndef __METAL_SIMDGROUP_EVENT
-#define __METAL_SIMDGROUP_EVENT
+#ifndef __REVERSE_LINKING_PROTOCOL
+#define __REVERSE_LINKING_PROTOCOL
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   %struct._simdgroup_event_t = type opaque
-//
-struct _simdgroup_event_t;
+// Command codes for the dispatch loop.
+constant constexpr uint CMD_DONE = 0;
+constant constexpr uint CMD_DUAL_COPY = 1;
+constant constexpr uint CMD_SINGLE_LOAD = 2;
+constant constexpr uint CMD_SINGLE_STORE = 3;
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   Bitcode: TBD
-//
-thread _simdgroup_event_t*
-__metal_simdgroup_async_copy_1d(
-  ulong, ulong, threadgroup void *, const device void *, ulong)
-  __asm("air.simdgroup_async_copy_1d.p3i8.p1i8");
+// Write dual async copy params (A+B device→TG) to the command area.
+// The IR shell will read these and execute 2D async copy.
+template <typename T_A, typename T_B>
+METAL_FUNC void request_dual_async_copy(
+  threadgroup uint* cmd,
+  // A params
+  const device T_A* A_src,
+  const device T_A* A_base,
+  ushort A_dst_elements_per_row,
+  uint A_src_elements_per_row,
+  ushort2 A_tile_src,
+  ushort2 A_tile_dst,
+  uint A_tg_byte_offset,
+  bool A_transpose,
+  // B params
+  const device T_B* B_src,
+  const device T_B* B_base,
+  ushort B_dst_elements_per_row,
+  uint B_src_elements_per_row,
+  ushort2 B_tile_src,
+  ushort2 B_tile_dst,
+  uint B_tg_byte_offset,
+  bool B_transpose
+) {
+  // Compute byte offsets from buffer base
+  ulong A_byte_offset = ulong(reinterpret_cast<const device uchar*>(A_src) -
+                               reinterpret_cast<const device uchar*>(A_base));
+  ulong B_byte_offset = ulong(reinterpret_cast<const device uchar*>(B_src) -
+                               reinterpret_cast<const device uchar*>(B_base));
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   Bitcode: TBD
-//
-thread _simdgroup_event_t*
-__metal_simdgroup_async_copy_1d(
-  ulong, ulong, device void *, const threadgroup void *, ulong)
-  __asm("air.simdgroup_async_copy_1d.p1i8.p3i8");
+  // Handle transpose by swapping tile dimensions
+  if (A_transpose) {
+    A_tile_src = A_tile_src.yx;
+    A_tile_dst = A_tile_dst.yx;
+  }
+  if (B_transpose) {
+    B_tile_src = B_tile_src.yx;
+    B_tile_dst = B_tile_dst.yx;
+  }
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   ; Function Attrs: argmemonly convergent nounwind
-//   declare %struct._simdgroup_event_t*
-//     @air.simdgroup_async_copy_2d.p3i8.p1i8(
-//       i64, i64,
-//       i8 addrspace(3)* nocapture writeonly, i64, i64, <2 x i64>,
-//       i8 addrspace(1)* nocapture readonly,  i64, i64, <2 x i64>,
-//       <2 x i64>, i32)
-//     local_unnamed_addr #4
-//
-thread _simdgroup_event_t*
-__metal_simdgroup_async_copy_2d(
-  ulong, ulong,
-  threadgroup void *, ulong, ulong, ulong2,
-  const device void *, ulong, ulong, ulong2,
-  long2, int)
-  __asm("air.simdgroup_async_copy_2d.p3i8.p1i8");
+  // All strides and tile dims are converted to BYTES for the shell
+  // (shell uses element_size=1, alignment=1).
+  constexpr uint A_sz = sizeof(T_A);
+  constexpr uint B_sz = sizeof(T_B);
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   ; Function Attrs: argmemonly convergent nounwind
-//   declare %struct._simdgroup_event_t*
-//     @air.simdgroup_async_copy_2d.p1i8.p3i8(
-//       i64, i64,
-//       i8 addrspace(1)* nocapture writeonly, i64, i64, <2 x i64>,
-//       i8 addrspace(3)* nocapture readonly,  i64, i64, <2 x i64>,
-//       <2 x i64>, i32)
-//     local_unnamed_addr #4
-//
-thread _simdgroup_event_t*
-__metal_simdgroup_async_copy_2d(
-  ulong, ulong,
-  device void *, ulong, ulong, ulong2,
-  const threadgroup void *, ulong, ulong, ulong2,
-  long2, int)
-  __asm("air.simdgroup_async_copy_2d.p1i8.p3i8");
+  // A copy params (in bytes)
+  cmd[1]  = A_dst_elements_per_row * A_sz;
+  cmd[2]  = A_src_elements_per_row * A_sz;
+  cmd[3]  = A_tile_src.x * A_sz;
+  cmd[4]  = A_tile_src.y;
+  cmd[5]  = uint(A_byte_offset & 0xFFFFFFFF);
+  cmd[6]  = uint(A_byte_offset >> 32);
+  cmd[7]  = A_tg_byte_offset;
 
-// Invoking the generation of LLVM bitcode for async copies.
-//
-//   ; Function Attrs: convergent nounwind
-//   declare void
-//     @air.wait_simdgroup_events(i32, %struct._simdgroup_event_t** nocapture)
-//     local_unnamed_addr #3
-//
-void __metal_wait_simdgroup_events(
-  int, thread _simdgroup_event_t**)
-  __asm("air.wait_simdgroup_events");
+  // A dst tile (in bytes, height unchanged)
+  cmd[21] = A_tile_dst.x * A_sz;
+  cmd[22] = A_tile_dst.y;
 
-#pragma METAL internals : enable
-namespace metal
-{
-  enum class simdgroup_async_copy_clamp_mode {
-    clamp_to_zero = 0,
-    clamp_to_edge = 1
-  };
-  
-  struct simdgroup_event {
-    METAL_FUNC simdgroup_event() thread {}
+  // B copy params (in bytes)
+  cmd[11] = B_dst_elements_per_row * B_sz;
+  cmd[12] = B_src_elements_per_row * B_sz;
+  cmd[13] = B_tile_src.x * B_sz;
+  cmd[14] = B_tile_src.y;
+  cmd[15] = uint(B_byte_offset & 0xFFFFFFFF);
+  cmd[16] = uint(B_byte_offset >> 32);
+  cmd[17] = B_tg_byte_offset;
 
-    template <typename T>
-    METAL_FUNC void async_copy(
-      threadgroup T *dst,
-      const device T *src,
-      ulong n_elements
-    ) thread {
-      event = __metal_simdgroup_async_copy_1d(
-        // Description of the data type.
-        sizeof(T),
-        alignof(T),
-        
-        // Description of the arguments.
-        reinterpret_cast<threadgroup void *>(dst),
-        reinterpret_cast<const device void *>(src),
-        n_elements);
+  // B dst tile (in bytes, height unchanged)
+  cmd[23] = B_tile_dst.x * B_sz;
+  cmd[24] = B_tile_dst.y;
+
+  // Issue command
+  cmd[0] = CMD_DUAL_COPY;
+}
+
+// Write single async copy params (device→TG or TG→device) to the command area.
+template <typename T>
+METAL_FUNC void request_single_async_copy(
+  threadgroup uint* cmd,
+  uint command_code,
+  const device T* src_or_dst,
+  const device T* base,
+  ushort tg_elements_per_row,
+  uint dev_elements_per_row,
+  ushort2 tile_dimensions,
+  uint tg_byte_offset,
+  bool transpose
+) {
+  ulong byte_offset = ulong(reinterpret_cast<const device uchar*>(src_or_dst) -
+                              reinterpret_cast<const device uchar*>(base));
+  if (transpose) {
+    tile_dimensions = tile_dimensions.yx;
+  }
+
+  // Convert to bytes for shell (element_size=1).
+  constexpr uint sz = sizeof(T);
+  uint dst_stride = (command_code == CMD_SINGLE_STORE) ? dev_elements_per_row : tg_elements_per_row;
+  uint src_stride = (command_code == CMD_SINGLE_STORE) ? tg_elements_per_row : dev_elements_per_row;
+  cmd[1]  = dst_stride * sz;
+  cmd[2]  = src_stride * sz;
+  cmd[3]  = tile_dimensions.x * sz;
+  cmd[4]  = tile_dimensions.y;
+  cmd[5]  = uint(byte_offset & 0xFFFFFFFF);
+  cmd[6]  = uint(byte_offset >> 32);
+  cmd[7]  = tg_byte_offset;
+
+  cmd[0] = command_code;
+}
+
+// Buffer-indexed variants for attention shell (which has 10 buffers).
+// cmd[8] = buffer index for single copy, cmd[8]/cmd[18] = A/B buffer indices for dual copy.
+
+template <typename T>
+METAL_FUNC void request_single_async_copy_indexed(
+  threadgroup uint* cmd,
+  uint command_code,
+  const device T* src_or_dst,
+  const device T* base,
+  ushort tg_elements_per_row,
+  uint dev_elements_per_row,
+  ushort2 tile_src,
+  ushort2 tile_dst,
+  uint tg_byte_offset,
+  bool transpose,
+  uint buffer_index
+) {
+  ulong byte_offset = ulong(reinterpret_cast<const device uchar*>(src_or_dst) -
+                              reinterpret_cast<const device uchar*>(base));
+  if (transpose) {
+    tile_src = tile_src.yx;
+    tile_dst = tile_dst.yx;
+  }
+
+  constexpr uint sz = sizeof(T);
+  uint dst_stride = (command_code == CMD_SINGLE_STORE) ? dev_elements_per_row : tg_elements_per_row;
+  uint src_stride = (command_code == CMD_SINGLE_STORE) ? tg_elements_per_row : dev_elements_per_row;
+  cmd[1]  = dst_stride * sz;
+  cmd[2]  = src_stride * sz;
+  cmd[3]  = tile_src.x * sz;
+  cmd[4]  = tile_src.y;
+  cmd[5]  = uint(byte_offset & 0xFFFFFFFF);
+  cmd[6]  = uint(byte_offset >> 32);
+  cmd[7]  = tg_byte_offset;
+  cmd[8]  = buffer_index;
+
+  // dst tile (for zero-padding)
+  cmd[21] = tile_dst.x * sz;
+  cmd[22] = tile_dst.y;
+
+  cmd[0] = command_code;
+}
+
+template <typename T_A, typename T_B>
+METAL_FUNC void request_dual_async_copy_indexed(
+  threadgroup uint* cmd,
+  // A params
+  const device T_A* A_src,
+  const device T_A* A_base,
+  ushort A_dst_elements_per_row,
+  uint A_src_elements_per_row,
+  ushort2 A_tile_src,
+  ushort2 A_tile_dst,
+  uint A_tg_byte_offset,
+  bool A_transpose,
+  uint A_buffer_index,
+  // B params
+  const device T_B* B_src,
+  const device T_B* B_base,
+  ushort B_dst_elements_per_row,
+  uint B_src_elements_per_row,
+  ushort2 B_tile_src,
+  ushort2 B_tile_dst,
+  uint B_tg_byte_offset,
+  bool B_transpose,
+  uint B_buffer_index
+) {
+  ulong A_byte_offset = ulong(reinterpret_cast<const device uchar*>(A_src) -
+                               reinterpret_cast<const device uchar*>(A_base));
+  ulong B_byte_offset = ulong(reinterpret_cast<const device uchar*>(B_src) -
+                               reinterpret_cast<const device uchar*>(B_base));
+
+  if (A_transpose) {
+    A_tile_src = A_tile_src.yx;
+    A_tile_dst = A_tile_dst.yx;
+  }
+  if (B_transpose) {
+    B_tile_src = B_tile_src.yx;
+    B_tile_dst = B_tile_dst.yx;
+  }
+
+  constexpr uint A_sz = sizeof(T_A);
+  constexpr uint B_sz = sizeof(T_B);
+
+  cmd[1]  = A_dst_elements_per_row * A_sz;
+  cmd[2]  = A_src_elements_per_row * A_sz;
+  cmd[3]  = A_tile_src.x * A_sz;
+  cmd[4]  = A_tile_src.y;
+  cmd[5]  = uint(A_byte_offset & 0xFFFFFFFF);
+  cmd[6]  = uint(A_byte_offset >> 32);
+  cmd[7]  = A_tg_byte_offset;
+  cmd[8]  = A_buffer_index;
+
+  cmd[21] = A_tile_dst.x * A_sz;
+  cmd[22] = A_tile_dst.y;
+
+  cmd[11] = B_dst_elements_per_row * B_sz;
+  cmd[12] = B_src_elements_per_row * B_sz;
+  cmd[13] = B_tile_src.x * B_sz;
+  cmd[14] = B_tile_src.y;
+  cmd[15] = uint(B_byte_offset & 0xFFFFFFFF);
+  cmd[16] = uint(B_byte_offset >> 32);
+  cmd[17] = B_tg_byte_offset;
+  cmd[18] = B_buffer_index;
+
+  cmd[23] = B_tile_dst.x * B_sz;
+  cmd[24] = B_tile_dst.y;
+
+  cmd[0] = CMD_DUAL_COPY;
+}
+
+#endif // __REVERSE_LINKING_PROTOCOL
+"""
+}
+
+/// Create cooperative threadgroup copy helpers that replace simdgroup_event
+/// async copies. All threads in the threadgroup participate in the copy,
+/// with automatic zero-padding for dst tiles larger than src tiles.
+///
+/// This eliminates all __asm("air.simdgroup_async_copy...") usage.
+func createCooperativeCopy() -> String {
+  return """
+// -*- Metal -*-
+//===-- cooperative_copy --------------------------------------------------===//
+// Threadgroup-cooperative copy replacing simdgroup_event async copies.
+// All threads participate; zero-pads dst region beyond src tile.
+//===----------------------------------------------------------------------===//
+
+#ifndef __COOPERATIVE_COPY
+#define __COOPERATIVE_COPY
+
+// 2D device→threadgroup copy with zero-padding.
+// dst_tile may be larger than src_tile; extra elements are zeroed.
+template <typename T>
+METAL_FUNC void cooperative_copy_2d(
+  threadgroup T* dst,
+  ushort dst_elements_per_row,
+  ushort2 dst_tile,          // (width, height)
+  const device T* src,
+  uint src_elements_per_row,
+  ushort2 src_tile,          // (width, height)
+  bool transpose,
+  uint tid,                  // thread index in threadgroup
+  uint threadgroup_size      // total threads in threadgroup
+) {
+  if (transpose) {
+    src_tile = src_tile.yx;
+    dst_tile = dst_tile.yx;
+  }
+
+  uint total_dst = uint(dst_tile.x) * uint(dst_tile.y);
+  for (uint i = tid; i < total_dst; i += threadgroup_size) {
+    ushort row = ushort(i / dst_tile.x);
+    ushort col = ushort(i % dst_tile.x);
+    T value = T(0);
+    if (row < src_tile.y && col < src_tile.x) {
+      value = src[uint(row) * src_elements_per_row + col];
     }
-    
-    template <typename T>
-    METAL_FUNC void async_copy(
-      device T *dst,
-      const threadgroup T *src,
-      ulong n_elements
-    ) thread {
-      event = __metal_simdgroup_async_copy_1d(
-        // Description of the data type.
-        sizeof(T),
-        alignof(T),
-        
-        // Description of the arguments.
-        reinterpret_cast<device void *>(dst),
-        reinterpret_cast<const threadgroup void *>(src),
-        n_elements);
-    }
-    
-    template <typename T>
-    METAL_FUNC void async_copy(
-      // Description of the destination.
-      threadgroup T *dst,
-      ushort dst_elements_per_row,
-      ushort2 dst_tile_dimensions,
+    dst[uint(row) * dst_elements_per_row + col] = value;
+  }
+}
 
-      // Description of the source.
-      const device T *src,
-      uint src_elements_per_row,
-      ushort2 src_tile_dimensions,
+// 2D threadgroup→device copy.
+template <typename T>
+METAL_FUNC void cooperative_store_2d(
+  device T* dst,
+  uint dst_elements_per_row,
+  ushort2 tile,              // (width, height)
+  const threadgroup T* src,
+  ushort src_elements_per_row,
+  bool transpose,
+  uint tid,
+  uint threadgroup_size
+) {
+  if (transpose) {
+    tile = tile.yx;
+  }
 
-      // Other arguments.
-      bool transpose_matrix = false,
-      simdgroup_async_copy_clamp_mode clamp_mode =
-        simdgroup_async_copy_clamp_mode::clamp_to_zero
-    ) thread {
-      if (transpose_matrix) {
-        src_tile_dimensions = src_tile_dimensions.yx;
-        dst_tile_dimensions = dst_tile_dimensions.yx;
-      }
-      event = __metal_simdgroup_async_copy_2d(
-        // Description of the data type.
-        sizeof(T),
-        alignof(T),
+  uint total = uint(tile.x) * uint(tile.y);
+  for (uint i = tid; i < total; i += threadgroup_size) {
+    ushort row = ushort(i / tile.x);
+    ushort col = ushort(i % tile.x);
+    dst[uint(row) * dst_elements_per_row + col] =
+      src[uint(row) * src_elements_per_row + col];
+  }
+}
 
-        // Description of the destination.
-        reinterpret_cast<threadgroup void *>(dst),
-        ushort(dst_elements_per_row),
-        1,
-        ulong2(dst_tile_dimensions),
+// 1D device→threadgroup copy with zero-padding.
+template <typename T>
+METAL_FUNC void cooperative_copy_1d(
+  threadgroup T* dst,
+  ushort dst_count,
+  const device T* src,
+  ushort src_count,
+  uint tid,
+  uint threadgroup_size
+) {
+  for (uint i = tid; i < dst_count; i += threadgroup_size) {
+    dst[i] = (i < src_count) ? src[i] : T(0);
+  }
+}
 
-        // Description of the source.
-        reinterpret_cast<const device void *>(src),
-        uint(src_elements_per_row),
-        1,
-        ulong2(src_tile_dimensions),
-
-        // Other arguments.
-        long2(0),
-        static_cast<int>(clamp_mode));
-    }
-    
-    template <typename T>
-    METAL_FUNC void async_copy(
-      // Description of the destination.
-      device T *dst,
-      uint dst_elements_per_row,
-      ushort2 dst_tile_dimensions,
-
-      // Description of the source.
-      const threadgroup T *src,
-      ushort src_elements_per_row,
-      ushort2 src_tile_dimensions,
-
-      // Other arguments.
-      bool transpose_matrix = false
-    ) thread {
-      if (transpose_matrix) {
-        src_tile_dimensions = src_tile_dimensions.yx;
-        dst_tile_dimensions = dst_tile_dimensions.yx;
-      }
-      event = __metal_simdgroup_async_copy_2d(
-        // Description of the data type.
-        sizeof(T),
-        alignof(T),
-
-        // Description of the destination.
-        reinterpret_cast<device void *>(dst),
-        uint(dst_elements_per_row),
-        1,
-        ulong2(dst_tile_dimensions),
-
-        // Description of the source.
-        reinterpret_cast<const threadgroup void *>(src),
-        ushort(src_elements_per_row),
-        1,
-        ulong2(src_tile_dimensions),
-
-        // Other arguments.
-        long2(0),
-        0);
-    }
-    
-    METAL_FUNC static void wait(int count, thread simdgroup_event *events) {
-      __metal_wait_simdgroup_events(
-        count, reinterpret_cast<thread _simdgroup_event_t**>(events));
-    }
-    
-  private:
-    // Invoking the generation of LLVM bitcode for async copies.
-    //
-    //   %"struct.metal::simdgroup_event" = type { %struct._simdgroup_event_t* }
-    //
-    thread _simdgroup_event_t* event;
-  };
-} // namespace metal
-#pragma METAL internals : disable
-
-#endif // __METAL_SIMDGROUP_EVENT
+#endif // __COOPERATIVE_COPY
 """
 }
 

@@ -115,16 +115,16 @@ extension AttentionKernel {
     
     func asyncLoadAccumulator() -> String {
       """
-      
+
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sidx == 0) {
+      {
         uint2 \(C)_offset(d_outer, \(parallelizationGroupOffset));
         auto src = simdgroup_matrix_storage<\(memoryName(C))>
         ::apply_offset(
           \(C), \(leadingDimension(C)),
           \(C)_offset, \(transposed(C)));
         auto dst = (threadgroup \(memoryName(C))*)(threadgroup_block);
-        
+
         ushort D_dimension = min(
           ushort(\(blockDimensions.head)),
           ushort(\(headDimension) - d_outer));
@@ -132,29 +132,28 @@ extension AttentionKernel {
           uint(\(blockDimensions.parallelization)),
           uint(\(parallelizationDimension) - \(parallelizationGroupOffset)));
         ushort2 tile(D_dimension, R_dimension);
-        
-        simdgroup_event event;
-        event.async_copy(
+
+        cooperative_copy_2d(
           dst, \(leadingBlockDimension(C)), tile,
-          src, \(leadingDimension(C)), tile, \(transposed(C)));
-        simdgroup_event::wait(1, &event);
+          src, \(leadingDimension(C)), tile,
+          \(transposed(C)), tid, tg_size);
       }
-      
+
       """
     }
-    
+
     func asyncStoreAccumulator() -> String {
       """
-      
+
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (sidx == 0) {
+      {
         uint2 \(C)_offset(d_outer, \(parallelizationGroupOffset));
         auto src = (threadgroup \(memoryName(C))*)(threadgroup_block);
         auto dst = simdgroup_matrix_storage<\(memoryName(C))>
         ::apply_offset(
           \(C), \(leadingDimension(C)),
           \(C)_offset, \(transposed(C)));
-        
+
         ushort D_dimension = min(
           ushort(\(blockDimensions.head)),
           ushort(\(headDimension) - d_outer));
@@ -162,14 +161,13 @@ extension AttentionKernel {
           uint(\(blockDimensions.parallelization)),
           uint(\(parallelizationDimension) - \(parallelizationGroupOffset)));
         ushort2 tile(D_dimension, R_dimension);
-        
-        simdgroup_event event;
-        event.async_copy(
+
+        cooperative_store_2d(
           dst, \(leadingDimension(C)), tile,
-          src, \(leadingBlockDimension(C)), tile, \(transposed(C)));
-        simdgroup_event::wait(1, &event);
+          src, \(leadingBlockDimension(C)),
+          \(transposed(C)), tid, tg_size);
       }
-      
+
       """
     }
     
@@ -317,16 +315,16 @@ extension AttentionKernel {
         return declareRHSLocation(descriptor: descriptor)
       case .threadgroup:
         return """
-        
+
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sidx == 0) {
+        {
           uint2 \(B)_offset(d_outer, \(traversalOffset));
           auto src = simdgroup_matrix_storage<\(memoryName(B))>
           ::apply_offset(
             \(B), \(leadingDimension(B)),
             \(B)_offset, \(transposed(B)));
           auto dst = (threadgroup \(memoryName(B))*)(threadgroup_block);
-          
+
           ushort D_dimension = min(
             ushort(\(blockDimensions.head)),
             ushort(\(headDimension) - d_outer));
@@ -338,16 +336,15 @@ extension AttentionKernel {
             ushort(C_src_dimension));
           ushort2 tile_src(D_dimension, C_src_dimension);
           ushort2 tile_dst(D_dimension, C_dst_dimension);
-          
-          simdgroup_event event;
-          event.async_copy(
+
+          cooperative_copy_2d(
             dst, \(leadingBlockDimension(B)), tile_dst,
-            src, \(leadingDimension(B)), tile_src, \(transposed(B)));
-          simdgroup_event::wait(1, &event);
+            src, \(leadingDimension(B)), tile_src,
+            \(transposed(B)), tid, tg_size);
         }
-        
+
         \(declareRHSLocation(descriptor: descriptor))
-        
+
         """
       }
     }

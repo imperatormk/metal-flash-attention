@@ -358,7 +358,116 @@ extension AttentionKernel {
         output,
         blockDimensions.traversal * 4)
     }
-    
+
     return output
+  }
+}
+
+// MARK: - Async Caching State Machine
+
+extension AttentionKernel {
+  /// Operands that are cached via async load (device→TG→registers) during setup.
+  func cachedLoadOperands() -> [AttentionOperand] {
+    switch type {
+    case .forward:
+      var ops: [AttentionOperand] = []
+      if cached(.Q) { ops.append(.Q) }
+      return ops
+    case .backwardQuery:
+      var ops: [AttentionOperand] = []
+      if cached(.Q) { ops.append(.Q) }
+      if cached(.dO) { ops.append(.dO) }
+      return ops
+    case .backwardKeyValue:
+      var ops: [AttentionOperand] = []
+      if cached(.K) { ops.append(.K) }
+      if cached(.V) { ops.append(.V) }
+      return ops
+    }
+  }
+
+  /// Operands that are cached via async store (registers→TG→device) during cleanup.
+  func cachedStoreOperands() -> [AttentionOperand] {
+    switch type {
+    case .forward:
+      var ops: [AttentionOperand] = []
+      if cached(.O) { ops.append(.O) }
+      return ops
+    case .backwardQuery:
+      var ops: [AttentionOperand] = []
+      if cached(.dQ) { ops.append(.dQ) }
+      return ops
+    case .backwardKeyValue:
+      var ops: [AttentionOperand] = []
+      if cached(.dK) { ops.append(.dK) }
+      if cached(.dV) { ops.append(.dV) }
+      return ops
+    }
+  }
+
+  /// Number of d_outer chunks needed to tile the head dimension.
+  func headDimensionChunks() -> Int {
+    Int((headDimension + blockDimensions.head - 1) / blockDimensions.head)
+  }
+
+  /// Number of resume points for caching loads (setup phase).
+  /// Each cached load operand needs headDimensionChunks resume points.
+  func cachingLoadResumePoints() -> Int {
+    cachedLoadOperands().count * headDimensionChunks()
+  }
+
+  /// Number of resume points for caching stores (cleanup phase).
+  /// Each cached store operand needs headDimensionChunks resume points.
+  func cachingStoreResumePoints() -> Int {
+    cachedStoreOperands().count * headDimensionChunks()
+  }
+
+  /// Byte offset in TG memory where the save area begins (after cmd + data areas).
+  /// cmd area = 128 bytes, data area = threadgroupMemoryAllocation bytes.
+  func saveTGOffset() -> UInt16 {
+    128 + threadgroupMemoryAllocation
+  }
+
+  /// Size in bytes needed to save one operand's registers to TG per SIMD.
+  /// Each thread holds 2 elements per 8x8 tile. With blockDimensions.head/8 tiles
+  /// per chunk, that's blockDimensions.head/8 * 2 elements per thread.
+  /// 32 threads per SIMD × elements × precision size.
+  func saveAreaSize(operand: AttentionOperand) -> UInt16 {
+    let precision = registerPrecisions[operand]!
+    let bytesPerElement = UInt16(precision.size)
+    // Each thread holds 2 elements per 8x8 SIMD tile.
+    // Full operand = paddedHeadDimension/8 tiles × 2 elements × bytesPerElement × 32 threads
+    // But we save the FULL operand's register state, not per-chunk.
+    let elementsPerThread = paddedHeadDimension / 8 * 2
+    let simdCount = blockDimensions.parallelization / 8
+    return elementsPerThread * bytesPerElement * 32 * simdCount
+  }
+}
+
+// MARK: - Shell Library
+
+import Metal
+
+extension AttentionKernel {
+  /// Pre-compiled IR kernel shell library (loaded once).
+  public static var shellLibrary: MTLLibrary?
+
+  /// Load the pre-compiled attention shell metallib.
+  public static func loadShellLibrary(device: MTLDevice) -> MTLLibrary {
+    if let lib = shellLibrary { return lib }
+
+    let bundle = Bundle.module
+    guard let url = bundle.url(
+      forResource: "attention_shell",
+      withExtension: "metallib"
+    ) else {
+      fatalError("""
+        Could not find attention_shell.metallib. \
+        Ensure it is included in the package resources.
+        """)
+    }
+    let lib = try! device.makeLibrary(URL: url)
+    shellLibrary = lib
+    return lib
   }
 }

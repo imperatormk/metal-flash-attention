@@ -58,7 +58,7 @@ final class AdversarialShapeTest: XCTestCase {
       // Run a test.
       var gemmDesc = GEMMDescriptor()
       gemmDesc.leadingDimensions = leadingDimensions
-      gemmDesc.loadPreviousC = loadPreviousC
+  gemmDesc.loadPreviousC = loadPreviousC
       gemmDesc.matrixDimensions = matrixDimensions
       gemmDesc.memoryPrecisions = memoryPrecisions
       gemmDesc.transposeState = transposeState

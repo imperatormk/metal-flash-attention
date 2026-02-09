@@ -12,11 +12,35 @@ extension GEMMKernel {
     kernel: GEMMKernel, library: MTLLibrary)
   public typealias PipelineValue = (
     kernel: GEMMKernel, pipeline: MTLComputePipelineState)
-  
+
   public static var libraryCache: [
     GEMMKernelDescriptor: LibraryValue] = [:]
   public static var pipelineCache: [
     GEMMDescriptor: PipelineValue] = [:]
+
+  /// Pre-compiled IR kernel shell library (loaded once).
+  public static var shellLibrary: MTLLibrary?
+
+  /// Load the pre-compiled GEMM shell metallib.
+  public static func loadShellLibrary(device: MTLDevice) -> MTLLibrary {
+    if let lib = shellLibrary { return lib }
+
+    // Look for gemm_shell_v2.metallib in the ReverseLink directory
+    // relative to the package sources.
+    let bundle = Bundle.module
+    guard let url = bundle.url(
+      forResource: "gemm_shell_v2",
+      withExtension: "metallib"
+    ) else {
+      fatalError("""
+        Could not find gemm_shell_v2.metallib. \
+        Ensure it is included in the package resources.
+        """)
+    }
+    let lib = try! device.makeLibrary(URL: url)
+    shellLibrary = lib
+    return lib
+  }
 }
 
 extension GEMMKernel {
@@ -25,9 +49,9 @@ extension GEMMKernel {
     guard pipelineCache[descriptor] == nil else {
       return
     }
-    
+
     var kernelDescriptor = GEMMKernelDescriptor(descriptor: descriptor)
-    
+
     let device = MTLContext.global.device
     if device.supportsFamily(.apple9) {
       kernelDescriptor.preferAsyncStore = false
@@ -41,7 +65,7 @@ extension GEMMKernel {
         kernelDescriptor.preferAsyncStore = true
       }
     }
-    
+
     func createLibrary(
       _ kernelDescriptor: GEMMKernelDescriptor
     ) -> LibraryValue {
@@ -51,27 +75,43 @@ extension GEMMKernel {
         let kernel = GEMMKernel(descriptor: kernelDescriptor)
         let source = kernel.createSource()
         let library = try! device.makeLibrary(source: source, options: nil)
-        
+
         let output = (kernel, library)
         GEMMKernel.libraryCache[kernelDescriptor] = output
         return output
       }
     }
-    
+
     func createPipeline(
       _ libraryValue: LibraryValue
     ) -> PipelineValue {
       let constants = MTLFunctionConstantValues()
       descriptor.setFunctionConstants(constants)
-      
-      let library = libraryValue.library
-      let function = try! library.makeFunction(
-        name: "gemm", constantValues: constants)
+
+      // Load the pre-compiled shell library.
+      let shellLib = GEMMKernel.loadShellLibrary(device: device)
+
+      // Get the kernel function from the shell.
+      let kernelFunction = try! shellLib.makeFunction(
+        name: "gemm", constantValues: MTLFunctionConstantValues())
+
+      // Get the visible function from the JIT-compiled library.
+      let visibleFunction = try! libraryValue.library.makeFunction(
+        name: "gemm_body", constantValues: constants)
+
+      // Create pipeline with reverse linking.
+      let pipelineDescriptor = MTLComputePipelineDescriptor()
+      pipelineDescriptor.computeFunction = kernelFunction
+
+      let linkedFunctions = MTLLinkedFunctions()
+      linkedFunctions.privateFunctions = [visibleFunction]
+      pipelineDescriptor.linkedFunctions = linkedFunctions
+
       let pipeline = try! device.makeComputePipelineState(
-        function: function)
+        descriptor: pipelineDescriptor, options: [], reflection: nil)
       return (libraryValue.kernel, pipeline)
     }
-    
+
     if kernelDescriptor.preferAsyncStore == nil {
       var candidates: [PipelineValue] = []
       for candidateID in 0..<4 {
@@ -93,17 +133,17 @@ extension GEMMKernel {
         default:
           fatalError("This should never happen.")
         }
-        
+
         // Set the attributes unique to this variant.
         var modifiedKernelDescriptor = kernelDescriptor
         modifiedKernelDescriptor.blockDimensions = blockDimensions
         modifiedKernelDescriptor.preferAsyncStore = preferAsyncStore
-        
+
         let libraryValue = createLibrary(modifiedKernelDescriptor)
         let pipelineValue = createPipeline(libraryValue)
         candidates.append(pipelineValue)
       }
-      
+
       // Find the maximum occupancy.
       var maximumOccupancy: Int = -1
       for candidate in candidates {
@@ -114,7 +154,7 @@ extension GEMMKernel {
       candidates.removeAll(where: {
         $0.pipeline.maxTotalThreadsPerThreadgroup != maximumOccupancy
       })
-      
+
       // Choose the highest-performing candidate.
       GEMMKernel.pipelineCache[descriptor] = candidates.last!
     } else {
