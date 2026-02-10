@@ -9,7 +9,7 @@ extension GEMMKernel {
   public func createSource() -> String {
     return """
 
-\(createReverseLinkingProtocol())
+\(createMetalSimdgroupEvent())
 \(createMetalSimdgroupMatrixStorage())
 using namespace metal;
 

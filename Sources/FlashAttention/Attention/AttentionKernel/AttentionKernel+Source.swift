@@ -20,129 +20,40 @@ extension AttentionKernel {
       }
     }
 
-    let loadRPs = cachingLoadResumePoints()
-    let storeRPs = cachingStoreResumePoints()
-    let hasAsyncCaching = loadRPs > 0 || storeRPs > 0
-
     return """
+    #include <metal_stdlib>
 
-    \(createReverseLinkingProtocol())
-    \(createCooperativeCopy())
+    \(createMetalSimdgroupEvent())
     \(createMetalSimdgroupMatrixStorage())
     using namespace metal;
 
     \(createConstants())
 
-    // Reverse-linking visible function for attention.
-    // Called by the pre-compiled IR kernel shell with incrementing resume_point.
-    // Async copy is handled by the shell; this function does all compute.
-    //
-    // TG layout:
-    //   [0..127]             = command area (32 x uint32)
-    //   [128..128+TGA]       = data area for operand tiles
-    //   [128+TGA..]          = save area for register state between resume points
+    // Declare the function.
+    kernel void attention(
+      \(createBufferBindings())
+      threadgroup uchar *threadgroup_block [[threadgroup(0)]],
 
-    [[visible]]
-    void attention_body(
-      threadgroup uchar *tg,
-      \(createRawBufferBindings())
-      uint resume_point,
-      uint gid_x,
-      uint lane_id_u,
-      uint sidx_u
+      uint3 gid [[threadgroup_position_in_grid]],
+      ushort sidx [[simdgroup_index_in_threadgroup]],
+      ushort lane_id [[thread_index_in_simdgroup]]
     ) {
-      auto cmd = (threadgroup uint*)(tg);
-      auto threadgroup_block = tg + 128;  // data area starts at byte 128
-
-      \(createTypedPointerCasts())
-
-      ushort sidx = ushort(sidx_u);
-      ushort lane_id = ushort(lane_id_u);
       ushort2 morton_offset = morton_order(lane_id);
-      uint tid = uint(sidx) * 32 + uint(lane_id);
-      uint tg_size = \(threadgroupSize);
-      uint gid = gid_x;
-      uint parallelization_group_offset = gid;
+
+      uint parallelization_group_offset = gid.x;
       parallelization_group_offset *= \(blockDimensions.parallelization);
 
       // Return early if the entire SIMD is out of bounds.
       if (\(parallelizationGroupOffset) >= \(parallelizationDimension)) {
-        cmd[0] = CMD_DONE;
         return;
       }
 
-    \(hasAsyncCaching ? createStateMachineDispatch(createLoop: createLoop) : createSinglePassBody(createLoop: createLoop))
-    }
-
-    """
-  }
-
-  /// Single-pass body when no operands are cached via async copy.
-  /// Falls back to the original sequential approach.
-  private func createSinglePassBody(createLoop: () -> String) -> String {
-    """
       \(createSetup())
       \(createLoop())
       \(createCleanup(type: type))
-
-      cmd[0] = CMD_DONE;
-    """
-  }
-
-  /// State machine dispatch for async caching.
-  /// Each resume_point corresponds to one step in the load/loop/store pipeline.
-  private func createStateMachineDispatch(createLoop: () -> String) -> String {
-    let loadRPs = cachingLoadResumePoints()
-    let storeRPs = cachingStoreResumePoints()
-    let chunks = headDimensionChunks()
-
-    // setup_end = loadRPs (all load resume points)
-    // loop_point = loadRPs (reads last load chunk + runs loop + first store)
-    // cleanup stores = loop_point + 1 .. loop_point + storeRPs
-    // scalar cleanup = loop_point + storeRPs + 1
-    let loopPoint = loadRPs
-    let scalarPoint = loopPoint + 1 + storeRPs
-
-    if storeRPs > 0 {
-      return """
-        // State machine: resume_point-based dispatch for async caching.
-        // Load phase: resume_point 0..\(loadRPs - 1)
-        // Loop phase: resume_point \(loopPoint)
-        // Store phase: resume_point \(loopPoint + 1)..\(loopPoint + storeRPs)
-        // Scalar+done: resume_point \(scalarPoint)
-
-        if (resume_point < \(loopPoint)) {
-          // --- Async caching load phase ---
-          \(createAsyncCachingLoadDispatch(chunks: chunks))
-        } else if (resume_point == \(loopPoint)) {
-          // --- Loop phase: read last load chunk, run traversal, begin stores ---
-          \(createLoopPhase(createLoop: createLoop, chunks: chunks))
-        } else if (resume_point <= \(loopPoint + storeRPs)) {
-          // --- Async caching store phase ---
-          \(createAsyncCachingStoreDispatch(chunks: chunks, loopPoint: loopPoint))
-        } else {
-          // --- Scalar cleanup + done ---
-          \(createScalarCleanup())
-          cmd[0] = CMD_DONE;
-        }
-      """
-    } else {
-      // No store operands — loop phase handles scalar cleanup and CMD_DONE
-      // directly. No store/scalar-cleanup resume points needed.
-      return """
-        // State machine: resume_point-based dispatch for async caching.
-        // Load phase: resume_point 0..\(loadRPs - 1)
-        // Loop+cleanup: resume_point \(loopPoint)
-
-        if (resume_point < \(loopPoint)) {
-          // --- Async caching load phase ---
-          \(createAsyncCachingLoadDispatch(chunks: chunks))
-        } else {
-          // --- Loop phase: read last load chunk, run traversal, cleanup, done ---
-          \(createLoopPhase(createLoop: createLoop, chunks: chunks))
-        }
-      """
     }
+
+    """
   }
 }
 
@@ -158,39 +69,6 @@ extension AttentionKernel {
     constant uint C [[function_constant(1)]];
 
     """
-  }
-
-  /// Generate raw `device uchar*` buffer arguments for the visible function.
-  func createRawBufferBindings() -> String {
-    // All 10 possible buffers, as raw uchar pointers.
-    // The shell passes them positionally matching buffer indices 0-9.
-    var output = ""
-    let bufferNames = ["buf0", "buf1", "buf2", "buf3", "buf4",
-                       "buf5", "buf6", "buf7", "buf8", "buf9"]
-    for name in bufferNames {
-      output += "  device uchar *\(name),\n"
-    }
-    return output
-  }
-
-  /// Generate typed pointer casts from raw buffers to typed operand pointers.
-  func createTypedPointerCasts() -> String {
-    var operands: [AttentionOperand] = []
-    switch type {
-    case .forward:
-      operands += [.Q, .K, .V, .O, .L]
-    case .backwardQuery:
-      operands += [.Q, .K, .V, .O, .dO, .dQ, .L, .D]
-    case .backwardKeyValue:
-      operands += [.Q, .K, .V, .dO, .dV, .dK, .L, .D]
-    }
-
-    var output = ""
-    for operand in operands {
-      guard let binding = operand.bufferBinding else { continue }
-      output += "auto \(operand) = (device \(memoryName(operand))*)(buf\(binding));\n"
-    }
-    return output
   }
 
   func createBufferBindings() -> String {

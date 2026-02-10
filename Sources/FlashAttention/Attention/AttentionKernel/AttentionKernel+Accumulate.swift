@@ -117,7 +117,7 @@ extension AttentionKernel {
       """
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      {
+      if (sidx == 0) {
         uint2 \(C)_offset(d_outer, \(parallelizationGroupOffset));
         auto src = simdgroup_matrix_storage<\(memoryName(C))>
         ::apply_offset(
@@ -133,10 +133,12 @@ extension AttentionKernel {
           uint(\(parallelizationDimension) - \(parallelizationGroupOffset)));
         ushort2 tile(D_dimension, R_dimension);
 
-        cooperative_copy_2d(
+        simdgroup_event event;
+        event.async_copy(
           dst, \(leadingBlockDimension(C)), tile,
           src, \(leadingDimension(C)), tile,
-          \(transposed(C)), tid, tg_size);
+          \(transposed(C)));
+        simdgroup_event::wait(1, &event);
       }
 
       """
@@ -146,7 +148,7 @@ extension AttentionKernel {
       """
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      {
+      if (sidx == 0) {
         uint2 \(C)_offset(d_outer, \(parallelizationGroupOffset));
         auto src = (threadgroup \(memoryName(C))*)(threadgroup_block);
         auto dst = simdgroup_matrix_storage<\(memoryName(C))>
@@ -162,10 +164,12 @@ extension AttentionKernel {
           uint(\(parallelizationDimension) - \(parallelizationGroupOffset)));
         ushort2 tile(D_dimension, R_dimension);
 
-        cooperative_store_2d(
+        simdgroup_event event;
+        event.async_copy(
           dst, \(leadingDimension(C)), tile,
-          src, \(leadingBlockDimension(C)),
-          \(transposed(C)), tid, tg_size);
+          src, \(leadingBlockDimension(C)), tile,
+          \(transposed(C)));
+        simdgroup_event::wait(1, &event);
       }
 
       """
@@ -317,7 +321,7 @@ extension AttentionKernel {
         return """
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
+        if (sidx == 0) {
           uint2 \(B)_offset(d_outer, \(traversalOffset));
           auto src = simdgroup_matrix_storage<\(memoryName(B))>
           ::apply_offset(
@@ -337,10 +341,12 @@ extension AttentionKernel {
           ushort2 tile_src(D_dimension, C_src_dimension);
           ushort2 tile_dst(D_dimension, C_dst_dimension);
 
-          cooperative_copy_2d(
+          simdgroup_event event;
+          event.async_copy(
             dst, \(leadingBlockDimension(B)), tile_dst,
             src, \(leadingDimension(B)), tile_src,
-            \(transposed(B)), tid, tg_size);
+            \(transposed(B)));
+          simdgroup_event::wait(1, &event);
         }
 
         \(declareRHSLocation(descriptor: descriptor))

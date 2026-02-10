@@ -180,20 +180,9 @@ private func profileAttention(N: Int, D: Int, kernel kt: AttentionKernelType) ->
   let constants = MTLFunctionConstantValues()
   desc.setFunctionConstants(constants)
 
-  // Reverse-linking pipeline: shell .metallib + visible fn
-  let shellLib = AttentionKernel.loadShellLibrary(device: device)
-  let kernelFn = try! shellLib.makeFunction(
-    name: "attention", constantValues: MTLFunctionConstantValues())
-  let visibleFn = try! library.makeFunction(
-    name: "attention_body", constantValues: constants)
-  let pipelineDesc = MTLComputePipelineDescriptor()
-  pipelineDesc.computeFunction = kernelFn
-  pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-  let linked = MTLLinkedFunctions()
-  linked.privateFunctions = [visibleFn]
-  pipelineDesc.linkedFunctions = linked
-  let pipeline = try! device.makeComputePipelineState(
-    descriptor: pipelineDesc, options: [], reflection: nil)
+  let function = try! library.makeFunction(
+    name: "attention", constantValues: constants)
+  let pipeline = try! device.makeComputePipelineState(function: function)
 
   let opSize = N * D
   let bufQ = MTLContext.global.createBuffer(network.Q, .FP32)
@@ -214,6 +203,8 @@ private func profileAttention(N: Int, D: Int, kernel kt: AttentionKernelType) ->
 
   func encode(_ enc: MTLComputeCommandEncoder) {
     enc.setComputePipelineState(pipeline)
+    enc.setThreadgroupMemoryLength(
+      Int(kernel.threadgroupMemoryAllocation), index: 0)
     enc.setBuffer(bufQ, offset: 0, index: 0)
     enc.setBuffer(bufK, offset: 0, index: 1)
     enc.setBuffer(bufV, offset: 0, index: 2)

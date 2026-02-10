@@ -1,8 +1,11 @@
 import XCTest
 import FlashAttention
+import MetalASM
+import Darwin
 
 final class SquareAttentionTest: XCTestCase {
   func testCorrectness() throws {
+    validateProblemSize(sequenceDimension: 4, headDimension: 2)
     validateProblemSize(sequenceDimension: 10, headDimension: 3)
     validateProblemSize(sequenceDimension: 10, headDimension: 80)
     validateProblemSize(sequenceDimension: 8, headDimension: 2)
@@ -215,14 +218,17 @@ private func validateProblemSize(
   sequenceDimension: Int,
   headDimension: Int
 ) {
+  print("[TEST] validateProblemSize seq=\(sequenceDimension) head=\(headDimension)"); fflush(stdout)
   var networkDesc = NetworkDescriptor()
   networkDesc.rowDimension = sequenceDimension
   networkDesc.columnDimension = sequenceDimension
   networkDesc.headDimension = headDimension
+  print("[TEST] creating network..."); fflush(stdout)
   let network = Network(descriptor: networkDesc)
-  
+  print("[TEST] network created"); fflush(stdout)
+
   // MARK: - Kernels
-  
+
   var attentionDesc = AttentionDescriptor()
   attentionDesc.lowPrecisionInputs = false
   attentionDesc.lowPrecisionIntermediates = false
@@ -231,48 +237,74 @@ private func validateProblemSize(
     column: UInt32(sequenceDimension),
     head: UInt16(headDimension))
   attentionDesc.transposeState = (Q: false, K: false, V: false, O: false)
-  
+
   func createKernel(type: AttentionKernelType) -> AttentionKernel {
+    print("[TEST]   kernelDescriptor(\(type))..."); fflush(stdout)
     let attentionKernelDesc = attentionDesc.kernelDescriptor(type: type)
+    print("[TEST]   AttentionKernel(\(type))..."); fflush(stdout)
     let attentionKernel = AttentionKernel(descriptor: attentionKernelDesc)
     return attentionKernel
   }
+  print("[TEST] creating forward kernel..."); fflush(stdout)
   let kernelForward = createKernel(type: .forward)
+  print("[TEST] creating bwd_q kernel...")
   let kernelBackwardQuery = createKernel(type: .backwardQuery)
+  print("[TEST] creating bwd_kv kernel...")
   let kernelBackwardKeyValue = createKernel(type: .backwardKeyValue)
-  
-  func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
+  print("[TEST] all kernels created"); fflush(stdout)
+
+  func createPipeline(
+    kernel: AttentionKernel,
+    type: AttentionKernelType
+  ) -> MTLComputePipelineState {
     let device = MTLContext.global.device
-    let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
+    guard let matrixDimensions = attentionDesc.matrixDimensions,
+          let transposeState = attentionDesc.transposeState else {
+      fatalError("Descriptor was incomplete.")
+    }
 
-    let functionConstants = MTLFunctionConstantValues()
-    attentionDesc.setFunctionConstants(functionConstants)
+    var monoDesc = AttentionKernel.MonolithicDescriptor()
+    monoDesc.R = matrixDimensions.row
+    monoDesc.C = matrixDimensions.column
+    let R = matrixDimensions.row
+    let C = matrixDimensions.column
+    let D = UInt32(matrixDimensions.head)
+    monoDesc.leadingDimensions[.Q] = transposeState.Q ? R : D
+    monoDesc.leadingDimensions[.K] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.V] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.O] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dO] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dV] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
 
-    // Load shell and get the kernel function from it.
-    let shellLib = AttentionKernel.loadShellLibrary(device: device)
-    let kernelFunction = try! shellLib.makeFunction(
-      name: "attention", constantValues: MTLFunctionConstantValues())
-
-    // Get the visible function from the JIT-compiled library.
-    let visibleFunction = try! library.makeFunction(
-      name: "attention_body", constantValues: functionConstants)
-
-    // Create pipeline with reverse linking.
-    let pipelineDesc = MTLComputePipelineDescriptor()
-    pipelineDesc.computeFunction = kernelFunction
-    pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-
-    let linkedFunctions = MTLLinkedFunctions()
-    linkedFunctions.privateFunctions = [visibleFunction]
-    pipelineDesc.linkedFunctions = linkedFunctions
-
-    return try! device.makeComputePipelineState(
-      descriptor: pipelineDesc, options: [], reflection: nil)
+    print("[TEST] generating IR for \(type)..."); fflush(stdout)
+    let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+    print("[TEST] IR generated, length=\(ir.count)"); fflush(stdout)
+    let typeName: String
+    switch type {
+    case .forward: typeName = "fwd"
+    case .backwardQuery: typeName = "bwd_q"
+    case .backwardKeyValue: typeName = "bwd_kv"
+    }
+    let irPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).ll"
+    try! ir.write(toFile: irPath, atomically: true, encoding: .utf8)
+    print("[TEST] assembling \(typeName)..."); fflush(stdout)
+    let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+    let metallibPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).metallib"
+    try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
+    print("[TEST] loading metallib for \(typeName)..."); fflush(stdout)
+    let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+    let function = library.makeFunction(name: "attention")!
+    return try! device.makeComputePipelineState(function: function)
   }
-  let pipelineForward = createPipeline(kernel: kernelForward)
-  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery)
-  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue)
+  print("[TEST] creating forward pipeline..."); fflush(stdout)
+  let pipelineForward = createPipeline(kernel: kernelForward, type: .forward)
+  print("[TEST] creating bwd_q pipeline..."); fflush(stdout)
+  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery, type: .backwardQuery)
+  print("[TEST] creating bwd_kv pipeline..."); fflush(stdout)
+  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue, type: .backwardKeyValue)
+  print("[TEST] all pipelines created"); fflush(stdout)
 
   // MARK: - Buffers
 
@@ -335,8 +367,9 @@ private func validateProblemSize(
       along parallelizationDimension: Int
     ) {
       encoder.setComputePipelineState(pipeline)
-      // Shell uses static @tg_buf (32KB), no dynamic TG allocation needed.
-      
+      encoder.setThreadgroupMemoryLength(
+        Int(kernel.threadgroupMemoryAllocation), index: 0)
+
       let blockCount = ceilDivide(
         parallelizationDimension, kernel.blockDimensions.parallelization)
       let gridSize = MTLSize(
@@ -598,38 +631,50 @@ private func profileProblemSize(
   let kernelBackwardQuery = createKernel(type: .backwardQuery)
   let kernelBackwardKeyValue = createKernel(type: .backwardKeyValue)
   
-  func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
+  func createPipeline(
+    kernel: AttentionKernel,
+    type: AttentionKernelType
+  ) -> MTLComputePipelineState {
     let device = MTLContext.global.device
-    let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
+    guard let matrixDimensions = attentionDesc.matrixDimensions,
+          let transposeState = attentionDesc.transposeState else {
+      fatalError("Descriptor was incomplete.")
+    }
 
-    let functionConstants = MTLFunctionConstantValues()
-    attentionDesc.setFunctionConstants(functionConstants)
+    var monoDesc = AttentionKernel.MonolithicDescriptor()
+    monoDesc.R = matrixDimensions.row
+    monoDesc.C = matrixDimensions.column
+    let R = matrixDimensions.row
+    let C = matrixDimensions.column
+    let D = UInt32(matrixDimensions.head)
+    monoDesc.leadingDimensions[.Q] = transposeState.Q ? R : D
+    monoDesc.leadingDimensions[.K] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.V] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.O] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dO] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dV] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
 
-    // Load shell and get the kernel function from it.
-    let shellLib = AttentionKernel.loadShellLibrary(device: device)
-    let kernelFunction = try! shellLib.makeFunction(
-      name: "attention", constantValues: MTLFunctionConstantValues())
-
-    // Get the visible function from the JIT-compiled library.
-    let visibleFunction = try! library.makeFunction(
-      name: "attention_body", constantValues: functionConstants)
-
-    // Create pipeline with reverse linking.
-    let pipelineDesc = MTLComputePipelineDescriptor()
-    pipelineDesc.computeFunction = kernelFunction
-    pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-
-    let linkedFunctions = MTLLinkedFunctions()
-    linkedFunctions.privateFunctions = [visibleFunction]
-    pipelineDesc.linkedFunctions = linkedFunctions
-
-    return try! device.makeComputePipelineState(
-      descriptor: pipelineDesc, options: [], reflection: nil)
+    let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+    let typeName: String
+    switch type {
+    case .forward: typeName = "fwd"
+    case .backwardQuery: typeName = "bwd_q"
+    case .backwardKeyValue: typeName = "bwd_kv"
+    }
+    let irPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).ll"
+    try! ir.write(toFile: irPath, atomically: true, encoding: .utf8)
+    let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+    let metallibPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).metallib"
+    try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
+    let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+    let function = library.makeFunction(name: "attention")!
+    return try! device.makeComputePipelineState(function: function)
   }
-  let pipelineForward = createPipeline(kernel: kernelForward)
-  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery)
-  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue)
+  let pipelineForward = createPipeline(kernel: kernelForward, type: .forward)
+  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery, type: .backwardQuery)
+  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue, type: .backwardKeyValue)
 
   // MARK: - Buffers
 
@@ -691,7 +736,8 @@ private func profileProblemSize(
       along parallelizationDimension: Int
     ) {
       encoder.setComputePipelineState(pipeline)
-      // Shell uses static @tg_buf (32KB), no dynamic TG allocation needed.
+      encoder.setThreadgroupMemoryLength(
+        Int(kernel.threadgroupMemoryAllocation), index: 0)
 
       let blockCount = ceilDivide(
         parallelizationDimension, kernel.blockDimensions.parallelization)

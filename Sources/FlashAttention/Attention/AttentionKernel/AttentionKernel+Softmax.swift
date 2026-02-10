@@ -128,7 +128,7 @@ extension AttentionKernel {
       return """
       
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      {
+      if (sidx == 0) {
         uint D_offset = \(truncatedHeadDimension);
         uint R_offset = \(parallelizationGroupOffset);
         uint2 offset_src(D_offset, R_offset);
@@ -154,15 +154,17 @@ extension AttentionKernel {
         ushort2 tile_src(D_src_dimension, R_dimension);
         ushort2 tile_dst(D_dst_dimension, R_dimension);
 
-        // Issue two cooperative copies.
-        cooperative_copy_2d(
+        // Issue two async copies.
+        simdgroup_event events[2];
+        events[0].async_copy(
           dO_dst, \(leadingBlockDimension(.dO)), tile_dst,
           dO_src, \(leadingDimension(.dO)), tile_src,
-          \(transposed(.dO)), tid, tg_size);
-        cooperative_copy_2d(
+          \(transposed(.dO)));
+        events[1].async_copy(
           O_dst, \(leadingBlockDimension(.O)), tile_dst,
           O_src, \(leadingDimension(.O)), tile_src,
-          \(transposed(.O)), tid, tg_size);
+          \(transposed(.O)));
+        simdgroup_event::wait(2, events);
       }
       
       // Where the dO and O data will be read from.
@@ -357,7 +359,7 @@ extension AttentionKernel {
       """
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      {
+      if (sidx == 0) {
         auto \(operand)_src = \(operand) + \(traversalOffset);
         auto \(operand)_dst =
         (threadgroup \(memoryName(operand))*)(threadgroup_block);
@@ -369,10 +371,12 @@ extension AttentionKernel {
           ushort(\(paddedTraversalEdge)),
           ushort(R_src_dimension));
 
-        cooperative_copy_1d(
-          \(operand)_dst, R_dst_dimension,
-          \(operand)_src, R_src_dimension,
-          tid, tg_size);
+        // Issue an async copy.
+        simdgroup_event event;
+        event.async_copy(
+          \(operand)_dst, 1, ushort2(R_dst_dimension, 1),
+          \(operand)_src, 1, ushort2(R_src_dimension, 1));
+        simdgroup_event::wait(1, &event);
       }
 
       """

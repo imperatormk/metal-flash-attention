@@ -461,3 +461,98 @@ func irGEMMKernelMetadata(kernelName: String = "gemm") -> String {
   !22 = !{!"monolithic_gemm.ll"}
   """
 }
+
+// MARK: - Attention Intrinsics
+
+/// Additional intrinsic declarations needed for attention kernels:
+/// simd_shuffle_xor, exp2, log2.
+func irAttentionIntrinsicDeclarations() -> String {
+  """
+
+  declare float @air.simd_shuffle_xor.f32(float, i32) #1
+  declare float @llvm.exp2.f32(float) #1
+  declare float @llvm.log2.f32(float) #1
+  """
+}
+
+/// Generate a simd_shuffle_xor call.
+func irShuffleXorCall(
+  result: String, value: String, mask: Int
+) -> String {
+  "  \(result) = call float @air.simd_shuffle_xor.f32(float \(value), i32 \(mask))"
+}
+
+/// Generate a fast exp2 call.
+func irExp2Call(result: String, value: String) -> String {
+  "  \(result) = call fast float @llvm.exp2.f32(float \(value))"
+}
+
+/// Generate a fast log2 call.
+func irLog2Call(result: String, value: String) -> String {
+  "  \(result) = call fast float @llvm.log2.f32(float \(value))"
+}
+
+// MARK: - Attention Kernel Metadata
+
+/// Generate metadata for an attention kernel with 10 device buffers
+/// (Q, K, V, O, L, D, dO, dV, dK, dQ) plus 1 TG buffer + system values.
+///
+/// Buffer bindings:
+///   0: Q (read), 1: K (read), 2: V (read), 3: O (read_write),
+///   4: L (read_write), 5: D (read_write),
+///   6: dO (read), 7: dV (read_write), 8: dK (read_write), 9: dQ (read_write)
+func irAttentionKernelMetadata(kernelName: String = "attention") -> String {
+  // Build the function type signature: 10 device buffers + 1 TG + gid + sidx + lane_id
+  let ptrArgs = (0..<10).map { _ in "i8 addrspace(1)*" }.joined(separator: ", ")
+  let fnType = "void (\(ptrArgs), i8 addrspace(3)*, <3 x i32>, i16, i16)"
+
+  return """
+
+  attributes #0 = { convergent mustprogress nounwind willreturn "frame-pointer"="none" "min-legal-vector-width"="96" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
+  attributes #1 = { convergent mustprogress nounwind willreturn }
+  attributes #2 = { argmemonly mustprogress nocallback nofree nosync nounwind willreturn }
+  attributes #3 = { convergent nounwind willreturn }
+  attributes #4 = { nounwind }
+
+  !air.kernel = !{!0}
+  !llvm.module.flags = !{!8, !9, !10, !11, !12, !13, !14}
+  !air.compile_options = !{!15, !16, !17}
+  !llvm.ident = !{!19}
+  !air.version = !{!20}
+  !air.language_version = !{!21}
+  !air.source_file_name = !{!22}
+
+  !0 = !{\(fnType)* @\(kernelName), !1, !2}
+  !1 = !{}
+  !2 = !{!30, !31, !32, !33, !34, !35, !36, !37, !38, !39, !40, !41, !42, !43}
+  !30 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"Q"}
+  !31 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"K"}
+  !32 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"V"}
+  !33 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"O"}
+  !34 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"L"}
+  !35 = !{i32 5, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"D_buf"}
+  !36 = !{i32 6, !"air.buffer", !"air.location_index", i32 6, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dO"}
+  !37 = !{i32 7, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dV"}
+  !38 = !{i32 8, !"air.buffer", !"air.location_index", i32 8, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dK"}
+  !39 = !{i32 9, !"air.buffer", !"air.location_index", i32 9, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dQ"}
+  !40 = !{i32 10, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"tg_mem"}
+  !41 = !{i32 11, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+  !42 = !{i32 12, !"air.simdgroup_index_in_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"sidx"}
+  !43 = !{i32 13, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane_id"}
+
+  !8 = !{i32 1, !"wchar_size", i32 4}
+  !9 = !{i32 7, !"air.max_device_buffers", i32 31}
+  !10 = !{i32 7, !"air.max_constant_buffers", i32 31}
+  !11 = !{i32 7, !"air.max_threadgroup_buffers", i32 31}
+  !12 = !{i32 7, !"air.max_textures", i32 128}
+  !13 = !{i32 7, !"air.max_read_write_textures", i32 8}
+  !14 = !{i32 7, !"air.max_samplers", i32 16}
+  !15 = !{!"air.compile.denorms_disable"}
+  !16 = !{!"air.compile.fast_math_enable"}
+  !17 = !{!"air.compile.framebuffer_fetch_enable"}
+  !19 = !{!"MetalASM (monolithic attention)"}
+  !20 = !{i32 2, i32 8, i32 0}
+  !21 = !{!"Metal", i32 4, i32 0, i32 0}
+  !22 = !{!"monolithic_attention.ll"}
+  """
+}
