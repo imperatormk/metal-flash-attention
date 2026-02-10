@@ -3,6 +3,7 @@
 // Results written to /tmp/bench_monolithic_results.txt
 import XCTest
 import FlashAttention
+import MetalASM
 
 final class BenchmarkTest: XCTestCase {
 
@@ -174,14 +175,29 @@ private func profileAttention(N: Int, D: Int, kernel kt: AttentionKernelType) ->
   desc.transposeState = (Q: false, K: false, V: false, O: false)
 
   let kernel = AttentionKernel(descriptor: desc.kernelDescriptor(type: kt))
-  let source = kernel.createSource()
   let device = MTLContext.global.device
-  let library = try! device.makeLibrary(source: source, options: nil)
-  let constants = MTLFunctionConstantValues()
-  desc.setFunctionConstants(constants)
 
-  let function = try! library.makeFunction(
-    name: "attention", constantValues: constants)
+  // Monolithic IR + MetalASM pipeline
+  var monoDesc = AttentionKernel.MonolithicDescriptor()
+  monoDesc.R = UInt32(N)
+  monoDesc.C = UInt32(N)
+  let D32 = UInt32(D)
+  monoDesc.leadingDimensions[.Q] = D32
+  monoDesc.leadingDimensions[.K] = D32
+  monoDesc.leadingDimensions[.V] = D32
+  monoDesc.leadingDimensions[.O] = D32
+  monoDesc.leadingDimensions[.L] = 1
+  monoDesc.leadingDimensions[.D] = 1
+  monoDesc.leadingDimensions[.dO] = D32
+  monoDesc.leadingDimensions[.dV] = D32
+  monoDesc.leadingDimensions[.dK] = D32
+  monoDesc.leadingDimensions[.dQ] = D32
+  let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+  let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+  let metallibPath = "/tmp/mfa_bench_\(N)x\(D)_\(kt).metallib"
+  try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
+  let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+  let function = library.makeFunction(name: "attention")!
   let pipeline = try! device.makeComputePipelineState(function: function)
 
   let opSize = N * D
