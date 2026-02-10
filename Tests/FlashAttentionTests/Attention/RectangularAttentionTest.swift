@@ -66,16 +66,28 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
     let device = MTLContext.global.device
     let source = kernel.createSource()
     let library = try! device.makeLibrary(source: source, options: nil)
-    
+
     let functionConstants = MTLFunctionConstantValues()
     attentionDesc.setFunctionConstants(functionConstants)
-    let function = try! library.makeFunction(
-      name: "attention", constantValues: functionConstants)
-    
-    // A critical part of the heuristic: force the occupancy to 1024 on M1.
+
+    // Load shell and get the kernel function from it.
+    let shellLib = AttentionKernel.loadShellLibrary(device: device)
+    let kernelFunction = try! shellLib.makeFunction(
+      name: "attention", constantValues: MTLFunctionConstantValues())
+
+    // Get the visible function from the JIT-compiled library.
+    let visibleFunction = try! library.makeFunction(
+      name: "attention_body", constantValues: functionConstants)
+
+    // Create pipeline with reverse linking.
     let pipelineDesc = MTLComputePipelineDescriptor()
-    pipelineDesc.computeFunction = function
+    pipelineDesc.computeFunction = kernelFunction
     pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
+
+    let linkedFunctions = MTLLinkedFunctions()
+    linkedFunctions.privateFunctions = [visibleFunction]
+    pipelineDesc.linkedFunctions = linkedFunctions
+
     return try! device.makeComputePipelineState(
       descriptor: pipelineDesc, options: [], reflection: nil)
   }
@@ -210,8 +222,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
       along parallelizationDimension: Int
     ) {
       encoder.setComputePipelineState(pipeline)
-      encoder.setThreadgroupMemoryLength(
-        Int(kernel.threadgroupMemoryAllocation), index: 0)
+      // Shell uses static @tg_buf (32KB), no dynamic TG allocation needed.
       
       let blockCount = ceilDivide(
         parallelizationDimension, kernel.blockDimensions.parallelization)

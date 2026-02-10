@@ -103,28 +103,46 @@ extension AttentionKernel {
     let loopPoint = loadRPs
     let scalarPoint = loopPoint + 1 + storeRPs
 
-    return """
-      // State machine: resume_point-based dispatch for async caching.
-      // Load phase: resume_point 0..\(loadRPs - 1)
-      // Loop phase: resume_point \(loopPoint)
-      // Store phase: resume_point \(loopPoint + 1)..\(loopPoint + storeRPs)
-      // Scalar+done: resume_point \(scalarPoint)
+    if storeRPs > 0 {
+      return """
+        // State machine: resume_point-based dispatch for async caching.
+        // Load phase: resume_point 0..\(loadRPs - 1)
+        // Loop phase: resume_point \(loopPoint)
+        // Store phase: resume_point \(loopPoint + 1)..\(loopPoint + storeRPs)
+        // Scalar+done: resume_point \(scalarPoint)
 
-      if (resume_point < \(loopPoint)) {
-        // --- Async caching load phase ---
-        \(createAsyncCachingLoadDispatch(chunks: chunks))
-      } else if (resume_point == \(loopPoint)) {
-        // --- Loop phase: read last load chunk, run traversal, begin stores ---
-        \(createLoopPhase(createLoop: createLoop, chunks: chunks))
-      } else if (resume_point <= \(loopPoint + storeRPs)) {
-        // --- Async caching store phase ---
-        \(createAsyncCachingStoreDispatch(chunks: chunks, loopPoint: loopPoint))
-      } else {
-        // --- Scalar cleanup + done ---
-        \(createScalarCleanup())
-        cmd[0] = CMD_DONE;
-      }
-    """
+        if (resume_point < \(loopPoint)) {
+          // --- Async caching load phase ---
+          \(createAsyncCachingLoadDispatch(chunks: chunks))
+        } else if (resume_point == \(loopPoint)) {
+          // --- Loop phase: read last load chunk, run traversal, begin stores ---
+          \(createLoopPhase(createLoop: createLoop, chunks: chunks))
+        } else if (resume_point <= \(loopPoint + storeRPs)) {
+          // --- Async caching store phase ---
+          \(createAsyncCachingStoreDispatch(chunks: chunks, loopPoint: loopPoint))
+        } else {
+          // --- Scalar cleanup + done ---
+          \(createScalarCleanup())
+          cmd[0] = CMD_DONE;
+        }
+      """
+    } else {
+      // No store operands — loop phase handles scalar cleanup and CMD_DONE
+      // directly. No store/scalar-cleanup resume points needed.
+      return """
+        // State machine: resume_point-based dispatch for async caching.
+        // Load phase: resume_point 0..\(loadRPs - 1)
+        // Loop+cleanup: resume_point \(loopPoint)
+
+        if (resume_point < \(loopPoint)) {
+          // --- Async caching load phase ---
+          \(createAsyncCachingLoadDispatch(chunks: chunks))
+        } else {
+          // --- Loop phase: read last load chunk, run traversal, cleanup, done ---
+          \(createLoopPhase(createLoop: createLoop, chunks: chunks))
+        }
+      """
+    }
   }
 }
 

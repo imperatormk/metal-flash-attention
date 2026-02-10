@@ -18,11 +18,15 @@ let package = Package(
       name: "FlashAttention",
       targets: ["FlashAttention"]),
   ],
+  dependencies: [
+    .package(name: "MetalASM", path: "../llvm"),
+  ],
   targets: [
     // Targets are the basic building blocks of a package, defining a module or a test suite.
     // Targets can depend on other targets in this package and products from dependencies.
     .target(
       name: "FlashAttention",
+      dependencies: ["MetalASM"],
       resources: [
         .copy("Resources/gemm_shell_v2.metallib"),
         .copy("Resources/attention_shell.metallib"),

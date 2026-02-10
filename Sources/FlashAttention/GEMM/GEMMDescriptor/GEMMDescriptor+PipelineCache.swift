@@ -6,41 +6,14 @@
 //
 
 import Metal
+import MetalASM
 
 extension GEMMKernel {
-  public typealias LibraryValue = (
-    kernel: GEMMKernel, library: MTLLibrary)
   public typealias PipelineValue = (
     kernel: GEMMKernel, pipeline: MTLComputePipelineState)
 
-  public static var libraryCache: [
-    GEMMKernelDescriptor: LibraryValue] = [:]
   public static var pipelineCache: [
     GEMMDescriptor: PipelineValue] = [:]
-
-  /// Pre-compiled IR kernel shell library (loaded once).
-  public static var shellLibrary: MTLLibrary?
-
-  /// Load the pre-compiled GEMM shell metallib.
-  public static func loadShellLibrary(device: MTLDevice) -> MTLLibrary {
-    if let lib = shellLibrary { return lib }
-
-    // Look for gemm_shell_v2.metallib in the ReverseLink directory
-    // relative to the package sources.
-    let bundle = Bundle.module
-    guard let url = bundle.url(
-      forResource: "gemm_shell_v2",
-      withExtension: "metallib"
-    ) else {
-      fatalError("""
-        Could not find gemm_shell_v2.metallib. \
-        Ensure it is included in the package resources.
-        """)
-    }
-    let lib = try! device.makeLibrary(URL: url)
-    shellLibrary = lib
-    return lib
-  }
 }
 
 extension GEMMKernel {
@@ -66,50 +39,78 @@ extension GEMMKernel {
       }
     }
 
-    func createLibrary(
+    /// Create a monolithic pipeline via MetalASM.
+    func createMonolithicPipeline(
       _ kernelDescriptor: GEMMKernelDescriptor
-    ) -> LibraryValue {
-      if let output = GEMMKernel.libraryCache[kernelDescriptor] {
-        return output
-      } else {
-        let kernel = GEMMKernel(descriptor: kernelDescriptor)
-        let source = kernel.createSource()
-        let library = try! device.makeLibrary(source: source, options: nil)
-
-        let output = (kernel, library)
-        GEMMKernel.libraryCache[kernelDescriptor] = output
-        return output
-      }
-    }
-
-    func createPipeline(
-      _ libraryValue: LibraryValue
     ) -> PipelineValue {
-      let constants = MTLFunctionConstantValues()
-      descriptor.setFunctionConstants(constants)
+      let kernel = GEMMKernel(descriptor: kernelDescriptor)
 
-      // Load the pre-compiled shell library.
-      let shellLib = GEMMKernel.loadShellLibrary(device: device)
+      // Build the MonolithicDescriptor from the GEMMDescriptor.
+      guard let matrixDimensions = descriptor.matrixDimensions,
+            let transposeState = descriptor.transposeState else {
+        fatalError("Descriptor was incomplete.")
+      }
 
-      // Get the kernel function from the shell.
-      let kernelFunction = try! shellLib.makeFunction(
-        name: "gemm", constantValues: MTLFunctionConstantValues())
+      var monoDesc = GEMMKernel.MonolithicDescriptor()
+      monoDesc.M = matrixDimensions.M
+      monoDesc.N = matrixDimensions.N
+      monoDesc.K = matrixDimensions.K
+      monoDesc.loadPreviousC = descriptor.loadPreviousC
 
-      // Get the visible function from the JIT-compiled library.
-      let visibleFunction = try! libraryValue.library.makeFunction(
-        name: "gemm_body", constantValues: constants)
+      // Compute leading dimensions (same logic as setFunctionConstants).
+      func chooseLeadingDimension(
+        _ specifiedLeading: UInt32?,
+        _ transposeState: Bool,
+        _ untransposedRows: UInt32,
+        _ untransposedColumns: UInt32
+      ) -> UInt32 {
+        var expectedLeading: UInt32
+        if transposeState {
+          expectedLeading = untransposedRows
+        } else {
+          expectedLeading = untransposedColumns
+        }
+        if let specifiedLeading {
+          guard specifiedLeading >= expectedLeading else {
+            fatalError("Leading dimension was too small.")
+          }
+          return specifiedLeading
+        }
+        return expectedLeading
+      }
+      monoDesc.leadingDimensionA = chooseLeadingDimension(
+        descriptor.leadingDimensions?.A, transposeState.A,
+        matrixDimensions.M, matrixDimensions.K)
+      monoDesc.leadingDimensionB = chooseLeadingDimension(
+        descriptor.leadingDimensions?.B, transposeState.B,
+        matrixDimensions.K, matrixDimensions.N)
+      monoDesc.leadingDimensionC = chooseLeadingDimension(
+        descriptor.leadingDimensions?.C, false,
+        matrixDimensions.M, matrixDimensions.N)
 
-      // Create pipeline with reverse linking.
-      let pipelineDescriptor = MTLComputePipelineDescriptor()
-      pipelineDescriptor.computeFunction = kernelFunction
+      // Generate monolithic LLVM IR and assemble in-process.
+      let ir = kernel.createMonolithicIR(descriptor: monoDesc)
 
-      let linkedFunctions = MTLLinkedFunctions()
-      linkedFunctions.privateFunctions = [visibleFunction]
-      pipelineDescriptor.linkedFunctions = linkedFunctions
+      // Debug: dump IR for analysis
+      let irDumpPath = "/tmp/mfa_gemm_debug.ll"
+      try! ir.write(toFile: irDumpPath, atomically: true, encoding: .utf8)
 
-      let pipeline = try! device.makeComputePipelineState(
-        descriptor: pipelineDescriptor, options: [], reflection: nil)
-      return (libraryValue.kernel, pipeline)
+      let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+
+      // Write to temp file and load via URL to avoid in-memory data issues.
+      guard let matrixDimensions = descriptor.matrixDimensions,
+            let ts = descriptor.transposeState else {
+        fatalError("Descriptor was incomplete.")
+      }
+      let tA = ts.A ? "T" : "N"
+      let tB = ts.B ? "T" : "N"
+      let metallibPath = "/tmp/mfa_gemm_\(matrixDimensions.M)x\(matrixDimensions.N)x\(matrixDimensions.K)_\(tA)\(tB)_\(kernelDescriptor.blockDimensions!.M)x\(kernelDescriptor.blockDimensions!.N)x\(kernelDescriptor.blockDimensions!.K).metallib"
+      try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
+      let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+      let function = library.makeFunction(name: "gemm")!
+      let pipeline = try! device.makeComputePipelineState(function: function)
+
+      return (kernel, pipeline)
     }
 
     if kernelDescriptor.preferAsyncStore == nil {
@@ -139,8 +140,7 @@ extension GEMMKernel {
         modifiedKernelDescriptor.blockDimensions = blockDimensions
         modifiedKernelDescriptor.preferAsyncStore = preferAsyncStore
 
-        let libraryValue = createLibrary(modifiedKernelDescriptor)
-        let pipelineValue = createPipeline(libraryValue)
+        let pipelineValue = createMonolithicPipeline(modifiedKernelDescriptor)
         candidates.append(pipelineValue)
       }
 
@@ -158,8 +158,7 @@ extension GEMMKernel {
       // Choose the highest-performing candidate.
       GEMMKernel.pipelineCache[descriptor] = candidates.last!
     } else {
-      let libraryValue = createLibrary(kernelDescriptor)
-      let pipelineValue = createPipeline(libraryValue)
+      let pipelineValue = createMonolithicPipeline(kernelDescriptor)
       GEMMKernel.pipelineCache[descriptor] = pipelineValue
     }
   }
