@@ -7,7 +7,7 @@
 
 /// The three kernels of the FlashAttention algorithm for devices without
 /// hardware acceleration for floating-point atomics.
-public enum AttentionKernelType {
+public enum AttentionKernelType: Hashable {
   /// Forward attention, computing O and L.
   case forward
   

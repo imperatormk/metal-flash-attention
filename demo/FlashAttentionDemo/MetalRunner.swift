@@ -51,10 +51,10 @@ private func ceilDiv(_ a: Int, _ b: UInt16) -> Int {
     (a + Int(b) - 1) / Int(b)
 }
 
-// MARK: - GEMM Benchmark (reverse-linking pipeline)
+// MARK: - GEMM Benchmark (monolithic IR via MetalASM)
 
 private func runGEMMBenchmark() -> BenchmarkResult {
-    let n: UInt32 = 512
+    let n: UInt32 = 1024
     let problemSize = Int(n)
     let precision: GEMMOperandPrecision = .FP32
 
@@ -64,7 +64,7 @@ private func runGEMMBenchmark() -> BenchmarkResult {
     gemmDesc.memoryPrecisions = (A: precision, B: precision, C: precision)
     gemmDesc.transposeState = (A: false, B: false)
 
-    // Register uses reverse-linking: shell .metallib + JIT visible function
+    // Register uses monolithic IR: LLVM IR → MetalASM → metallib → pipeline
     GEMMKernel.register(descriptor: gemmDesc)
     guard let cached = GEMMKernel.pipelineCache[gemmDesc] else {
         return BenchmarkResult(name: "GEMM 512x512", status: .fail, timeMs: 0,
@@ -126,19 +126,18 @@ private func runGEMMBenchmark() -> BenchmarkResult {
     let gflops = Int(Double(ops) / (gpuTime / 1000.0) / 1e9)
 
     return BenchmarkResult(
-        name: "GEMM \(problemSize)x\(problemSize)",
+        name: "GEMM \(problemSize)",
         status: passed ? .pass : .fail,
         timeMs: gpuTime,
         detail: passed ? "\(gflops) GFLOPS, max err \(String(format: "%.1e", maxError))"
                        : "FAILED: max err \(String(format: "%.1e", maxError))")
 }
 
-// MARK: - Attention Forward Benchmark (reverse-linking pipeline)
+// MARK: - Attention Forward Benchmark (monolithic IR via MetalASM)
 
 private func runAttentionBenchmark() -> BenchmarkResult {
-    let device = MTLContext.global.device
-    let seqLen = 64
-    let headDim = 32
+    let seqLen = 512
+    let headDim = 64
 
     var attentionDesc = AttentionDescriptor()
     attentionDesc.lowPrecisionInputs = false
@@ -149,59 +148,12 @@ private func runAttentionBenchmark() -> BenchmarkResult {
         head: UInt16(headDim))
     attentionDesc.transposeState = (Q: false, K: false, V: false, O: false)
 
-    let kernelDesc = attentionDesc.kernelDescriptor(type: .forward)
-    let kernel = AttentionKernel(descriptor: kernelDesc)
-    let source = kernel.createSource()
-
-    // JIT compile the visible function (pure Metal, no __asm)
-    let jitLibrary: MTLLibrary
-    do {
-        jitLibrary = try device.makeLibrary(source: source, options: nil)
-    } catch {
+    // Register creates all 3 kernel types via monolithic IR + MetalASM
+    AttentionKernel.register(descriptor: attentionDesc)
+    guard let cache = AttentionKernel.pipelineCache[attentionDesc],
+          let (kernel, pipeline) = cache[.forward] else {
         return BenchmarkResult(name: "Attention Forward", status: .fail, timeMs: 0,
-                               detail: "JIT compile failed: \(error.localizedDescription)")
-    }
-
-    let constants = MTLFunctionConstantValues()
-    attentionDesc.setFunctionConstants(constants)
-
-    // Load shell (pre-compiled .metallib with async copy intrinsics)
-    let shellLib = AttentionKernel.loadShellLibrary(device: device)
-    let kernelFunction: MTLFunction
-    do {
-        kernelFunction = try shellLib.makeFunction(
-            name: "attention", constantValues: MTLFunctionConstantValues())
-    } catch {
-        return BenchmarkResult(name: "Attention Forward", status: .fail, timeMs: 0,
-                               detail: "Shell function failed: \(error.localizedDescription)")
-    }
-
-    // Get JIT visible function
-    let visibleFunction: MTLFunction
-    do {
-        visibleFunction = try jitLibrary.makeFunction(
-            name: "attention_body", constantValues: constants)
-    } catch {
-        return BenchmarkResult(name: "Attention Forward", status: .fail, timeMs: 0,
-                               detail: "Visible function failed: \(error.localizedDescription)")
-    }
-
-    // Reverse-linking pipeline: shell + privateFunctions
-    let pipelineDesc = MTLComputePipelineDescriptor()
-    pipelineDesc.computeFunction = kernelFunction
-    pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-
-    let linkedFunctions = MTLLinkedFunctions()
-    linkedFunctions.privateFunctions = [visibleFunction]
-    pipelineDesc.linkedFunctions = linkedFunctions
-
-    let pipeline: MTLComputePipelineState
-    do {
-        pipeline = try device.makeComputePipelineState(
-            descriptor: pipelineDesc, options: [], reflection: nil)
-    } catch {
-        return BenchmarkResult(name: "Attention Forward", status: .fail, timeMs: 0,
-                               detail: "Pipeline failed: \(error.localizedDescription)")
+                               detail: "Pipeline creation failed")
     }
 
     // Create random input data
