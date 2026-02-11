@@ -149,7 +149,7 @@ extension AttentionKernel {
     }
 
     ir += generateOuterProduct(
-      prefix: "bq_op_",
+      prefix: "qo_",
       A: .Q, B: .K, C_name: "s",
       sSramCount: sSramCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -167,7 +167,7 @@ extension AttentionKernel {
 
     // Mask S at traversal edge (same as forward — zeroes S beyond traversalDim)
     ir += generateMaskEdge(
-      prefix: "bq_mask_",
+      prefix: "qm_",
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%bq_c",
@@ -177,12 +177,12 @@ extension AttentionKernel {
     // Step 2: P = exp2(S * scaleFactor - L)
     // Unlike forward (online softmax), backward uses stored L.
     ir += generateSoftmaxFromL(
-      prefix: "bq_sf_",
+      prefix: "qs_",
       sSramCount: sSramCount,
       regS: regS, regP: regP,
       scaleFactor: scaleFactor,
       lScalar: "%L_sram",
-      sSource: "bq_mask_s"  // masked S from generateMaskEdge
+      sSource: "qm_s"  // masked S from generateMaskEdge
     )
 
     // Step 3: dP = dO * V^T (outer product)
@@ -191,7 +191,7 @@ extension AttentionKernel {
     }
 
     ir += generateOuterProduct(
-      prefix: "bq_dp_",
+      prefix: "qp_",
       A: .dO, B: .V, C_name: "dp",
       sSramCount: sSramCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -209,18 +209,18 @@ extension AttentionKernel {
 
     // Step 4: dS = P * (dP * derivScale - D_sram)
     ir += generateDerivativeSoftmax(
-      prefix: "bq_ds_",
+      prefix: "qd_",
       sSramCount: sSramCount,
       regP: regP, regdP: regdP, regdS: regdS,
       derivScale: derivScale,
       dScalar: "%D_sram",
-      pSource: "bq_sf_p",   // from generateSoftmaxFromL with prefix "bq_sf_"
+      pSource: "qs_p",   // from generateSoftmaxFromL with prefix "qs_"
       dpSource: "dp_final"   // from generateOuterProduct with C_name "dp"
     )
 
     // Step 5: dQ += dS * K (accumulate)
     ir += generateAccumulate(
-      prefix: "bq_acc_",
+      prefix: "qa_",
       A: .dS, B: .K, C_name: "dq",
       accCount: dqCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -236,7 +236,7 @@ extension AttentionKernel {
       cachedC: isCacheddQ,
       isFinalScale: false,
       scaleCorrection: "",
-      aSourcePrefix: "bq_ds_ds"  // from generateDerivativeSoftmax with prefix "bq_ds_"
+      aSourcePrefix: "qd_ds"  // from generateDerivativeSoftmax with prefix "qd_"
     )
 
     // MARK: - Loop Latch
@@ -249,7 +249,7 @@ extension AttentionKernel {
     """
 
     for i in 0..<dqCount {
-      ir += "  %dq_acc_\(i) = phi \(irVecType(regdQ)) [%bq_acc_dq_final_\(i), %bq_acc_after_head]\n"
+      ir += "  %dq_acc_\(i) = phi \(irVecType(regdQ)) [%qa_dq_final_\(i), %qa_after_head]\n"
     }
 
     ir += """
@@ -262,7 +262,7 @@ extension AttentionKernel {
     // MARK: - Cleanup: store dQ, store D
 
     ir += generateBackwardQueryCleanup(
-      prefix: "bqcl_",
+      prefix: "qc_",
       dqCount: dqCount,
       blockP: blockP, blockH: blockH,
       D: D, paddedD: paddedD, headEdge: headEdge,
@@ -404,7 +404,7 @@ extension AttentionKernel {
     }
 
     ir += generateOuterProduct(
-      prefix: "bkv_op_",
+      prefix: "ko_",
       A: .K, B: .Q, C_name: "s",
       sSramCount: sSramCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -422,7 +422,7 @@ extension AttentionKernel {
 
     // Mask S^T at traversal edge
     ir += generateMaskEdge(
-      prefix: "bkv_mask_",
+      prefix: "km_",
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%bkv_r",
@@ -433,7 +433,7 @@ extension AttentionKernel {
     // L varies per-column of S^T (each column = different traversal row),
     // so it must be loaded per-tile from the L buffer.
     ir += generateSoftmaxFromLVector(
-      prefix: "bkv_sf_",
+      prefix: "ks_",
       sSramCount: sSramCount,
       regS: regS, regP: regP,
       scaleFactor: scaleFactor,
@@ -441,12 +441,12 @@ extension AttentionKernel {
       traversalOffset: "%bkv_r",
       traversalDim: traversalDim,
       memL: memPrec(.L),
-      sSource: "bkv_mask_s"  // masked S from generateMaskEdge
+      sSource: "km_s"  // masked S from generateMaskEdge
     )
 
     // Step 3: dV += P^T * dO (accumulate)
     ir += generateAccumulate(
-      prefix: "bkv_dv_",
+      prefix: "kv_",
       A: .P, B: .dO, C_name: "dv",
       accCount: dvCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -462,7 +462,7 @@ extension AttentionKernel {
       cachedC: isCacheddV,
       isFinalScale: false,
       scaleCorrection: "",
-      aSourcePrefix: "bkv_sf_p"  // from generateSoftmaxFromLVector with prefix "bkv_sf_"
+      aSourcePrefix: "ks_p"  // from generateSoftmaxFromLVector with prefix "ks_"
     )
 
     // Step 4: dP^T = V * dO^T (outer product)
@@ -471,7 +471,7 @@ extension AttentionKernel {
     }
 
     ir += generateOuterProduct(
-      prefix: "bkv_dp_",
+      prefix: "kp_",
       A: .V, B: .dO, C_name: "dp",
       sSramCount: sSramCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -492,7 +492,7 @@ extension AttentionKernel {
     // D varies per-column of S^T (each column = different traversal row),
     // so it must be loaded per-tile, not once per traversal block.
     ir += generateDerivativeSoftmaxVector(
-      prefix: "bkv_ds_",
+      prefix: "kd_",
       sSramCount: sSramCount,
       regP: regP, regdP: regdP, regdS: regdS,
       derivScale: derivScale,
@@ -500,13 +500,13 @@ extension AttentionKernel {
       traversalOffset: "%bkv_r",
       traversalDim: traversalDim,
       memD: memPrec(.D),
-      pSource: "bkv_sf_p",   // from generateSoftmaxFromLVector with prefix "bkv_sf_"
+      pSource: "ks_p",   // from generateSoftmaxFromLVector with prefix "ks_"
       dpSource: "dp_final"    // from generateOuterProduct with C_name "dp"
     )
 
     // Step 6: dK += dS^T * Q (accumulate)
     ir += generateAccumulate(
-      prefix: "bkv_dk_",
+      prefix: "kk_",
       A: .dS, B: .Q, C_name: "dk",
       accCount: dkCount,
       blockP: blockP, blockT: blockT, blockH: blockH,
@@ -522,7 +522,7 @@ extension AttentionKernel {
       cachedC: isCacheddK,
       isFinalScale: false,
       scaleCorrection: "",
-      aSourcePrefix: "bkv_ds_ds"  // from generateDerivativeSoftmaxVector with prefix "bkv_ds_"
+      aSourcePrefix: "kd_ds"  // from generateDerivativeSoftmaxVector with prefix "kd_"
     )
 
     // MARK: - Loop Latch
@@ -535,10 +535,10 @@ extension AttentionKernel {
     """
 
     for i in 0..<dkCount {
-      ir += "  %dk_acc_\(i) = phi \(irVecType(regdK)) [%bkv_dk_dk_final_\(i), %bkv_dk_after_head]\n"
+      ir += "  %dk_acc_\(i) = phi \(irVecType(regdK)) [%kk_dk_final_\(i), %kk_after_head]\n"
     }
     for i in 0..<dvCount {
-      ir += "  %dv_acc_\(i) = phi \(irVecType(regdV)) [%bkv_dv_dv_final_\(i), %bkv_dk_after_head]\n"
+      ir += "  %dv_acc_\(i) = phi \(irVecType(regdV)) [%kv_dv_final_\(i), %kk_after_head]\n"
     }
 
     ir += """
@@ -551,7 +551,7 @@ extension AttentionKernel {
     // MARK: - Cleanup: store dK, store dV
 
     ir += generateBackwardKeyValueCleanup(
-      prefix: "bkvcl_",
+      prefix: "kc_",
       dkCount: dkCount, dvCount: dvCount,
       blockP: blockP, blockH: blockH,
       D: D, paddedD: paddedD, headEdge: headEdge,

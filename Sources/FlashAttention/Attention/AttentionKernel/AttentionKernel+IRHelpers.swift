@@ -448,7 +448,7 @@ extension AttentionKernel {
     // We unroll the head dimension loop at codegen time (same as Metal source)
     // Head loop: d_outer from 0 to headLoopFloor by blockH, then edge
     func emitHeadIteration(dOuterVal: UInt32, regSize: UInt32, iterIdx: Int) {
-      let ip = "\(p)h\(iterIdx)_"
+      let ip = "\(p)\(iterIdx)_"
       let dOuterStr = "\(dOuterVal)"
       let kSteps = Int(regSize / 8)
 
@@ -461,7 +461,7 @@ extension AttentionKernel {
         // Async copy B (K) to TG (skip first iter if already loaded externally)
         if !(skipFirstIterCopy && iterIdx == 0) {
           ir += generateAsyncCopyDeviceToTG(
-            prefix: "\(ip)b_",
+            prefix: "\(ip)b",
             buffer: "%\(B)",
             operand: B,
             dOuter: dOuterStr,
@@ -489,14 +489,14 @@ extension AttentionKernel {
           let headOffsetA = Int(dOuterVal) + kOff
 
           // Load A (Q) directly from device memory for this d step
-          let aPrefix = "\(ip)a_k\(k)_"
+          let aPrefix = "\(ip)a\(k)_"
           let aNeedsMask = needsHeadMaskA && headOffsetA + 8 > Int(D)
 
           // Check at codegen time: is this entire k-step beyond D?
           if needsHeadMaskA && headOffsetA >= D {
             ir += "  %\(aPrefix)sram = bitcast \(irVecType(regA)) zeroinitializer to \(irVecType(regA))\n"
           } else {
-            let aLoadPrefix = aNeedsMask ? "\(aPrefix)raw_" : aPrefix
+            let aLoadPrefix = aNeedsMask ? "\(aPrefix)r_" : aPrefix
             // Q address: Q[seq, head] where seq = parallelization thread offset,
             // head = d_outer + kOff + morton_x (each thread's 2 elements)
             if transposedA {
@@ -541,7 +541,7 @@ extension AttentionKernel {
           // Load B (K) tiles from TG and multiply immediately
           for t in 0..<sSramCount {
             let tOff = t * 8
-            let bPrefix = "\(ip)b_k\(k)_t\(t)_"
+            let bPrefix = "\(ip)b\(k)x\(t)_"
             let headOffsetB = Int(dOuterVal) + kOff
             let bNeedsMask = needsHeadMaskB && headOffsetB + 8 > Int(D)
 
@@ -552,7 +552,7 @@ extension AttentionKernel {
             } else {
               // Use a raw prefix when head masking is needed, so TG load
               // produces %{raw}sram and we can select into %{b}sram
-              let loadPrefix = bNeedsMask ? "\(bPrefix)raw_" : bPrefix
+              let loadPrefix = bNeedsMask ? "\(bPrefix)r_" : bPrefix
               if transposedB {
                 ir += "  %\(loadPrefix)row = add i32 %morton_y, \(kOff)\n"
                 ir += "  %\(loadPrefix)col = add i32 %morton_x, \(tOff)\n"
@@ -579,8 +579,8 @@ extension AttentionKernel {
               }
             }
 
-            let cIn = (k == 0) ? cNames[t] : "%\(ip)c_k\(k-1)_t\(t)"
-            let cOut = "%\(ip)c_k\(k)_t\(t)"
+            let cIn = (k == 0) ? cNames[t] : "%\(ip)c\(k-1)x\(t)"
+            let cOut = "%\(ip)c\(k)x\(t)"
             ir += irMultiplyAccumulateCall(
               result: cOut,
               A: ("%\(aPrefix)sram", regA),
@@ -594,7 +594,7 @@ extension AttentionKernel {
         // A is cached: only B needs TG. Copy B → load B → use cached A → matmul.
         if !(skipFirstIterCopy && iterIdx == 0) {
           ir += generateAsyncCopyDeviceToTG(
-            prefix: "\(ip)b_",
+            prefix: "\(ip)b",
             buffer: "%\(B)",
             operand: B,
             dOuter: dOuterStr,
@@ -615,21 +615,21 @@ extension AttentionKernel {
           let kOff = k * 8
 
           // Use cached A register
-          let aPrefix = "\(ip)a_k\(k)_"
+          let aPrefix = "\(ip)a\(k)_"
           let cachedIdx = (Int(dOuterVal) + kOff) / 8
           ir += "  %\(aPrefix)sram = bitcast \(irVecType(regA)) %\(cachePrefix)sram_\(cachedIdx) to \(irVecType(regA))\n"
 
           // Load B tile(s) and multiply-accumulate
           for t in 0..<sSramCount {
             let tOff = t * 8
-            let bPrefix = "\(ip)b_k\(k)_t\(t)_"
+            let bPrefix = "\(ip)b\(k)x\(t)_"
             let headOffsetB = Int(dOuterVal) + kOff
             let bNeedsMask = needsHeadMaskB && headOffsetB + 8 > Int(D)
 
             if needsHeadMaskB && headOffsetB >= D {
               ir += "  %\(bPrefix)sram = bitcast \(irVecType(regB)) zeroinitializer to \(irVecType(regB))\n"
             } else {
-              let loadPrefix = bNeedsMask ? "\(bPrefix)raw_" : bPrefix
+              let loadPrefix = bNeedsMask ? "\(bPrefix)r_" : bPrefix
               if transposedB {
                 ir += "  %\(loadPrefix)row = add i32 %morton_y, \(kOff)\n"
                 ir += "  %\(loadPrefix)col = add i32 %morton_x, \(tOff)\n"
@@ -655,8 +655,8 @@ extension AttentionKernel {
               }
             }
 
-            let cIn = (k == 0) ? cNames[t] : "%\(ip)c_k\(k-1)_t\(t)"
-            let cOut = "%\(ip)c_k\(k)_t\(t)"
+            let cIn = (k == 0) ? cNames[t] : "%\(ip)c\(k-1)x\(t)"
+            let cOut = "%\(ip)c\(k)x\(t)"
             ir += irMultiplyAccumulateCall(
               result: cOut,
               A: ("%\(aPrefix)sram", regA),
@@ -672,7 +672,7 @@ extension AttentionKernel {
 
       // Update accumulator names
       let lastK = kSteps - 1
-      cNames = (0..<sSramCount).map { "%\(ip)c_k\(lastK)_t\($0)" }
+      cNames = (0..<sSramCount).map { "%\(ip)c\(lastK)x\($0)" }
     }
 
     // Emit head iterations
@@ -1028,12 +1028,12 @@ extension AttentionKernel {
     var cNames = (0..<accCount).map { "%\(p)corrected_\($0)" }
 
     func emitHeadIteration(dOuterVal: UInt32, regSize: UInt32, iterIdx: Int) {
-      let ip = "\(p)h\(iterIdx)_"
+      let ip = "\(p)\(iterIdx)_"
 
       // Async copy V to TG (skip first iter if already loaded externally)
       if !(skipFirstIterCopy && iterIdx == 0) {
         ir += generateAsyncCopyDeviceToTG(
-          prefix: "\(ip)v_",
+          prefix: "\(ip)v",
           buffer: "%\(B)",
           operand: B,
           dOuter: "\(dOuterVal)",
@@ -1071,13 +1071,13 @@ extension AttentionKernel {
 
           // Load V tile from TG for this (k, d) pair.
           // V = B operand: B[k,j] = V[k,j] where k=traversal, j=head.
-          let vPrefix = "\(ip)v_k\(k)_d\(d)_"
+          let vPrefix = "\(ip)v\(k)x\(d)_"
 
           if needsHeadMaskB && absHeadOff >= Int(D) {
             // Entire B register is beyond D — zero it
             ir += "  %\(vPrefix)sram = bitcast \(irVecType(regB)) zeroinitializer to \(irVecType(regB))\n"
           } else {
-            let loadPrefix = bNeedsMask ? "\(vPrefix)raw_" : vPrefix
+            let loadPrefix = bNeedsMask ? "\(vPrefix)r_" : vPrefix
             if transposedB {
               ir += "  %\(loadPrefix)row = add i32 %morton_x, \(dOff)\n"
               ir += "  %\(loadPrefix)col = add i32 %morton_y, \(kOff)\n"
@@ -1115,9 +1115,9 @@ extension AttentionKernel {
           if k == 0 {
             cInActual = cNames[accIdx]
           } else {
-            cInActual = "%\(ip)c_k\(k-1)_d\(d)"
+            cInActual = "%\(ip)c\(k-1)d\(d)"
           }
-          let cOut = "%\(ip)c_k\(k)_d\(d)"
+          let cOut = "%\(ip)c\(k)d\(d)"
 
           ir += irMultiplyAccumulateCall(
             result: cOut,
@@ -1135,7 +1135,7 @@ extension AttentionKernel {
       let lastK = kSteps - 1
       for d in 0..<dSteps {
         let accIdx = Int(dOuterVal) / 8 + d
-        cNames[accIdx] = "%\(ip)c_k\(lastK)_d\(d)"
+        cNames[accIdx] = "%\(ip)c\(lastK)d\(d)"
       }
     }
 
@@ -1196,7 +1196,7 @@ extension AttentionKernel {
     var iterIdx = 0
     while dOuter < paddedD {
       let regSize = min(UInt32(blockH), paddedD - dOuter)
-      let ip = "\(p)d\(iterIdx)_"
+      let ip = "\(p)\(iterIdx)_"
 
       let kSteps = Int(regSize / 8)
       for k in 0..<kSteps {
@@ -1304,7 +1304,7 @@ extension AttentionKernel {
     var iterIdx = 0
     while dOuter < paddedD {
       let regSize = min(UInt32(blockH), paddedD - dOuter)
-      let ip = "\(p)st\(iterIdx)_"
+      let ip = "\(p)\(iterIdx)_"
       let kSteps = Int(regSize / 8)
 
       // Store registers to TG
@@ -1823,7 +1823,7 @@ extension AttentionKernel {
       for k in 0..<kSteps {
         let kOff = k * 8
         let headStart = Int(dOuter) + kOff
-        let ip = "\(p)d\(iterIdx)_k\(k)_"
+        let ip = "\(p)\(iterIdx)k\(k)_"
 
         // Skip if beyond D
         if headStart >= D {
@@ -2011,7 +2011,7 @@ extension AttentionKernel {
     var iterIdx = 0
     while dOuter < paddedD {
       let regSize = min(UInt32(blockH), paddedD - dOuter)
-      let ip = "\(p)st\(iterIdx)_"
+      let ip = "\(p)\(iterIdx)_"
       let kSteps = Int(regSize / 8)
 
       // Store registers to TG
@@ -2190,7 +2190,7 @@ extension AttentionKernel {
     // Store dQ via cache store
     ir += generateCacheStore(
       operand: .dQ,
-      prefix: "\(p)dq_",
+      prefix: "\(p)q",
       regCount: dqCount,
       blockP: blockP, blockH: blockH,
       D: D, paddedD: paddedD, headEdge: headEdge,
@@ -2254,7 +2254,7 @@ extension AttentionKernel {
     // Store dV via cache store
     ir += generateCacheStore(
       operand: .dV,
-      prefix: "\(p)dv_",
+      prefix: "\(p)v",
       regCount: dvCount,
       blockP: blockP, blockH: blockH,
       D: D, paddedD: paddedD, headEdge: headEdge,
@@ -2269,7 +2269,7 @@ extension AttentionKernel {
     // Store dK via cache store
     ir += generateCacheStore(
       operand: .dK,
-      prefix: "\(p)dk_",
+      prefix: "\(p)k",
       regCount: dkCount,
       blockP: blockP, blockH: blockH,
       D: D, paddedD: paddedD, headEdge: headEdge,

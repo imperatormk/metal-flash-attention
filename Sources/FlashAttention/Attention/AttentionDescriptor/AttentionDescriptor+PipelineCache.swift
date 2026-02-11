@@ -44,28 +44,47 @@ extension AttentionKernel {
 }
 
 extension AttentionKernel {
-  /// Register kernel types for the given attention descriptor.
-  /// When `inferenceOnly` is true, only the forward kernel is compiled.
+  /// Lazily get a pipeline for a specific kernel type.
+  /// Compiles only the requested kernel on first access; cached thereafter.
+  public static func pipeline(
+    for descriptor: AttentionDescriptor, type: AttentionKernelType
+  ) -> PipelineValue {
+    if let cached = pipelineCache[descriptor]?[type] {
+      return cached
+    }
+    compileSingle(descriptor: descriptor, type: type)
+    return pipelineCache[descriptor]![type]!
+  }
+
+  /// Eagerly register all kernel types (or just forward with inferenceOnly).
+  /// Use this for warmup screens where you want to pay compile cost upfront.
   public static func register(
     descriptor: AttentionDescriptor, inferenceOnly: Bool = false
   ) {
-    if let existing = pipelineCache[descriptor] {
-      if !inferenceOnly || existing[.forward] != nil { return }
-    }
+    let types: [AttentionKernelType] = inferenceOnly
+      ? [.forward]
+      : [.forward, .backwardQuery, .backwardKeyValue]
 
+    for type in types {
+      if pipelineCache[descriptor]?[type] != nil { continue }
+      compileSingle(descriptor: descriptor, type: type)
+    }
+  }
+
+  /// Compile a single kernel type for the given descriptor.
+  private static func compileSingle(
+    descriptor: AttentionDescriptor, type: AttentionKernelType
+  ) {
     guard let matrixDimensions = descriptor.matrixDimensions,
           let transposeState = descriptor.transposeState else {
       fatalError("Descriptor was incomplete.")
     }
-
-    let compileStart = CFAbsoluteTimeGetCurrent()
 
     let device = MTLContext.global.device
     let R = matrixDimensions.row
     let C = matrixDimensions.column
     let D = UInt32(matrixDimensions.head)
 
-    // Build the MonolithicDescriptor (shared across all kernel types).
     var monoDesc = AttentionKernel.MonolithicDescriptor()
     monoDesc.R = R
     monoDesc.C = C
@@ -78,51 +97,38 @@ extension AttentionKernel {
     monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
     monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
 
-    var entries: [AttentionKernelType: PipelineValue] = [:]
+    let t1 = CFAbsoluteTimeGetCurrent()
+    let kernelDesc = descriptor.kernelDescriptor(type: type)
+    let kernel = AttentionKernel(descriptor: kernelDesc)
 
-    let types: [AttentionKernelType] = inferenceOnly
-      ? [.forward]
-      : [.forward, .backwardQuery, .backwardKeyValue]
+    let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+    let t2 = CFAbsoluteTimeGetCurrent()
 
-    for type in types {
-      let t0 = CFAbsoluteTimeGetCurrent()
-      let kernelDesc = descriptor.kernelDescriptor(type: type)
-      let kernel = AttentionKernel(descriptor: kernelDesc)
-      let t1 = CFAbsoluteTimeGetCurrent()
+    #if os(macOS)
+    let metallibData = try! MetalASM.assemble(
+      ir: ir, platform: .macOS(version: 26))
+    #elseif os(iOS)
+    let metallibData = try! MetalASM.assemble(
+      ir: ir, platform: .iOS(version: 26))
+    #endif
+    let t3 = CFAbsoluteTimeGetCurrent()
 
-      let ir = kernel.createMonolithicIR(descriptor: monoDesc)
-      let t2 = CFAbsoluteTimeGetCurrent()
-
-      #if os(macOS)
-      let metallibData = try! MetalASM.assemble(
-        ir: ir, platform: .macOS(version: 26))
-      #elseif os(iOS)
-      let metallibData = try! MetalASM.assemble(
-        ir: ir, platform: .iOS(version: 26))
-      #endif
-      let t3 = CFAbsoluteTimeGetCurrent()
-
-      let dispatchData = metallibData.withUnsafeBytes {
-        DispatchData(bytes: $0)
-      }
-      let library = try! device.makeLibrary(data: dispatchData)
-      let function = library.makeFunction(name: "attention")!
-      let pipeline = try! device.makeComputePipelineState(function: function)
-      let t4 = CFAbsoluteTimeGetCurrent()
-
-      FlashAttentionLog.shared.append(
-        String(format: "  %@: IR=%.0fms (%dKB) asm=%.0fms gpu=%.0fms",
-               "\(type)", (t2-t1)*1000, ir.utf8.count / 1024, (t3-t2)*1000, (t4-t3)*1000))
-      FlashAttentionLog.shared.append("    \(MetalASM._lastTiming)")
-
-      entries[type] = (kernel, pipeline)
+    let dispatchData = metallibData.withUnsafeBytes {
+      DispatchData(bytes: $0)
     }
+    let library = try! device.makeLibrary(data: dispatchData)
+    let function = library.makeFunction(name: "attention")!
+    let pipeline = try! device.makeComputePipelineState(function: function)
+    let t4 = CFAbsoluteTimeGetCurrent()
 
-    let elapsed = CFAbsoluteTimeGetCurrent() - compileStart
     FlashAttentionLog.shared.append(
-      String(format: "[FlashAttn] R=%d C=%d D=%d → %.0fms",
-             matrixDimensions.row, matrixDimensions.column,
-             matrixDimensions.head, elapsed * 1000))
-    pipelineCache[descriptor] = entries
+      String(format: "  %@: IR=%.0fms (%dKB) asm=%.0fms gpu=%.0fms",
+             "\(type)", (t2-t1)*1000, ir.utf8.count / 1024, (t3-t2)*1000, (t4-t3)*1000))
+    FlashAttentionLog.shared.append("    \(MetalASM._lastTiming)")
+
+    if pipelineCache[descriptor] == nil {
+      pipelineCache[descriptor] = [:]
+    }
+    pipelineCache[descriptor]![type] = (kernel, pipeline)
   }
 }
