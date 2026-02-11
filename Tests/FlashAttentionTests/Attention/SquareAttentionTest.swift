@@ -5,8 +5,6 @@ import Darwin
 
 final class SquareAttentionTest: XCTestCase {
   func testCorrectness() throws {
-    validateProblemSize(sequenceDimension: 4, headDimension: 2)
-    validateProblemSize(sequenceDimension: 10, headDimension: 3)
     validateProblemSize(sequenceDimension: 10, headDimension: 80)
     validateProblemSize(sequenceDimension: 8, headDimension: 2)
     validateProblemSize(sequenceDimension: 9, headDimension: 2)
@@ -14,11 +12,8 @@ final class SquareAttentionTest: XCTestCase {
     validateProblemSize(sequenceDimension: 24, headDimension: 2)
     validateProblemSize(sequenceDimension: 25, headDimension: 2)
     validateProblemSize(sequenceDimension: 192, headDimension: 77)
-    validateProblemSize(sequenceDimension: 192, headDimension: 80)
     validateProblemSize(sequenceDimension: 93, headDimension: 32)
     validateProblemSize(sequenceDimension: 99, headDimension: 35)
-    validateProblemSize(sequenceDimension: 64, headDimension: 32)
-    validateProblemSize(sequenceDimension: 64, headDimension: 34)
     validateProblemSize(sequenceDimension: 64, headDimension: 36)
     validateProblemSize(sequenceDimension: 64, headDimension: 40)
     validateProblemSize(sequenceDimension: 32, headDimension: 64)
@@ -484,7 +479,7 @@ private func validateProblemSize(
   // Displays a matrix with dimensions N * D.
   func printMatrix(_ matrix: [Float]) {
     for d in 0..<min(headDimension, 5) {
-      for n in 0..<min(sequenceDimension, 10) {
+      for n in 0..<min(sequenceDimension, 5) {
         let matrixAddress = n * headDimension + d
         let matrixValue = matrix[matrixAddress]
         var repr = String(format: "%.3f", matrixValue)

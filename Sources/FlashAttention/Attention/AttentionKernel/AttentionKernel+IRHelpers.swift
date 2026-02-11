@@ -290,13 +290,23 @@ extension AttentionKernel {
     leadingDimA: UInt32, leadingDimB: UInt32,
     leadingBlockDimA: UInt32, leadingBlockDimB: UInt32,
     cachedA: Bool,
-    transposedA: Bool, transposedB: Bool
+    transposedA: Bool, transposedB: Bool,
+    cachePrefix: String = "cq_"  // prefix for cached A registers (e.g., "cq_", "ck_", "cv_", "cdo_")
   ) -> String {
     var ir = ""
     ir += "  ; === Outer Product \(A) * \(B)^T → \(C_name) ===\n"
 
     // Current accumulator names (chained through d_outer iterations)
     var cNames = (0..<sSramCount).map { "%\(C_name)_init_\($0)" }
+
+    // Head masking for B (K/V) TG loads: when D < paddedD, TG columns beyond D
+    // contain garbage (async_copy doesn't zero-fill). If a thread's head position
+    // >= D, the loaded register must be zeroed to prevent NaN poisoning the matmul.
+    // The head position for B's TG load depends on transpose state:
+    //   non-transposed B: col = morton_y + kOff  (head dim along TG columns)
+    //   transposed B:     row = morton_y + kOff  (head dim along TG rows)
+    // In both cases, morton_y + kOff is the head offset to check against D.
+    let needsHeadMaskB = D < paddedD
 
     // We unroll the head dimension loop at codegen time (same as Metal source)
     // Head loop: d_outer from 0 to headLoopFloor by blockH, then edge
@@ -328,66 +338,106 @@ extension AttentionKernel {
           transposed: transposedB
         )
 
+        // Head masking for A (Q) when not cached — same NaN prevention
+        // as cached Q, but applied per d-step in the uncached path.
+        let needsHeadMaskA = D < paddedD
+
         // Interleaved: for each d step, load Q from device, then
         // for each traversal tile, load K from TG + matmul.
         for k in 0..<kSteps {
           let kOff = k * 8
+          let headOffsetA = Int(dOuterVal) + kOff
 
           // Load A (Q) directly from device memory for this d step
           let aPrefix = "\(ip)a_k\(k)_"
-          // Q address: Q[seq, head] where seq = parallelization thread offset,
-          // head = d_outer + kOff + morton_x (each thread's 2 elements)
-          if transposedA {
-            // Q stored as Q^T[head, seq]: addr = (head) * leadingDimA + (seq)
-            ir += "  %\(aPrefix)seq = add i32 %oig_y, 0\n"
-            ir += "  %\(aPrefix)head = add i32 %morton_x, \(Int(dOuterVal) + kOff)\n"
-            ir += generateDeviceLoad(
-              prefix: aPrefix,
-              bufferName: "%\(A)",
-              seqOffset: "%\(aPrefix)seq",
-              headOffset: "%\(aPrefix)head",
-              leadingDim: leadingDimA,
-              memPrec: memA,
-              regPrec: regA,
-              transposed: true
-            )
+          let aNeedsMask = needsHeadMaskA && headOffsetA + 8 > Int(D)
+
+          // Check at codegen time: is this entire k-step beyond D?
+          if needsHeadMaskA && headOffsetA >= D {
+            ir += "  %\(aPrefix)sram = bitcast \(irVecType(regA)) zeroinitializer to \(irVecType(regA))\n"
           } else {
-            // Q stored as Q[seq, head]: addr = (seq) * leadingDimA + (head)
-            ir += "  %\(aPrefix)seq = add i32 %oig_y, 0\n"
-            ir += "  %\(aPrefix)head = add i32 %morton_x, \(Int(dOuterVal) + kOff)\n"
-            ir += generateDeviceLoad(
-              prefix: aPrefix,
-              bufferName: "%\(A)",
-              seqOffset: "%\(aPrefix)seq",
-              headOffset: "%\(aPrefix)head",
-              leadingDim: leadingDimA,
-              memPrec: memA,
-              regPrec: regA,
-              transposed: false
-            )
+            let aLoadPrefix = aNeedsMask ? "\(aPrefix)raw_" : aPrefix
+            // Q address: Q[seq, head] where seq = parallelization thread offset,
+            // head = d_outer + kOff + morton_x (each thread's 2 elements)
+            if transposedA {
+              // Q stored as Q^T[head, seq]: addr = (head) * leadingDimA + (seq)
+              ir += "  %\(aLoadPrefix)seq = add i32 %clamped_par_off, 0\n"
+              ir += "  %\(aLoadPrefix)head = add i32 %morton_x, \(headOffsetA)\n"
+              ir += generateDeviceLoad(
+                prefix: aLoadPrefix,
+                bufferName: "%\(A)",
+                seqOffset: "%\(aLoadPrefix)seq",
+                headOffset: "%\(aLoadPrefix)head",
+                leadingDim: leadingDimA,
+                memPrec: memA,
+                regPrec: regA,
+                transposed: true
+              )
+            } else {
+              // Q stored as Q[seq, head]: addr = (seq) * leadingDimA + (head)
+              ir += "  %\(aLoadPrefix)seq = add i32 %clamped_par_off, 0\n"
+              ir += "  %\(aLoadPrefix)head = add i32 %morton_x, \(headOffsetA)\n"
+              ir += generateDeviceLoad(
+                prefix: aLoadPrefix,
+                bufferName: "%\(A)",
+                seqOffset: "%\(aLoadPrefix)seq",
+                headOffset: "%\(aLoadPrefix)head",
+                leadingDim: leadingDimA,
+                memPrec: memA,
+                regPrec: regA,
+                transposed: false
+              )
+            }
+
+            // Head masking: zero when morton_x * 2 + headOffset >= D
+            if aNeedsMask {
+              ir += "  %\(aPrefix)hpos = shl i32 %morton_x, 1\n"
+              ir += "  %\(aPrefix)hpos2 = add i32 %\(aPrefix)hpos, \(headOffsetA)\n"
+              ir += "  %\(aPrefix)oob = icmp uge i32 %\(aPrefix)hpos2, \(D)\n"
+              ir += "  %\(aPrefix)sram = select i1 %\(aPrefix)oob, \(irVecType(regA)) zeroinitializer, \(irVecType(regA)) %\(aLoadPrefix)sram\n"
+            }
           }
 
           // Load B (K) tiles from TG and multiply immediately
           for t in 0..<sSramCount {
             let tOff = t * 8
             let bPrefix = "\(ip)b_k\(k)_t\(t)_"
-            if transposedB {
-              ir += "  %\(bPrefix)row = add i32 %morton_y, \(kOff)\n"
-              ir += "  %\(bPrefix)col = add i32 %morton_x, \(tOff)\n"
+            let headOffsetB = Int(dOuterVal) + kOff
+            let bNeedsMask = needsHeadMaskB && headOffsetB + 8 > Int(D)
+
+            // Check at codegen time: is this entire k-step beyond D?
+            if needsHeadMaskB && headOffsetB >= D {
+              // Entire B register is beyond D — zero it
+              ir += "  %\(bPrefix)sram = bitcast \(irVecType(regB)) zeroinitializer to \(irVecType(regB))\n"
             } else {
-              ir += "  %\(bPrefix)row = add i32 %morton_x, \(tOff)\n"
-              ir += "  %\(bPrefix)col = add i32 %morton_y, \(kOff)\n"
+              // Use a raw prefix when head masking is needed, so TG load
+              // produces %{raw}sram and we can select into %{b}sram
+              let loadPrefix = bNeedsMask ? "\(bPrefix)raw_" : bPrefix
+              if transposedB {
+                ir += "  %\(loadPrefix)row = add i32 %morton_y, \(kOff)\n"
+                ir += "  %\(loadPrefix)col = add i32 %morton_x, \(tOff)\n"
+              } else {
+                ir += "  %\(loadPrefix)row = add i32 %morton_x, \(tOff)\n"
+                ir += "  %\(loadPrefix)col = add i32 %morton_y, \(kOff)\n"
+              }
+              ir += generateTGLoad(
+                prefix: loadPrefix,
+                tgOffset: "0",
+                rowOffset: "%\(loadPrefix)row",
+                colOffset: "%\(loadPrefix)col",
+                leadingBlockDim: leadingBlockDimB,
+                memPrec: memB,
+                regPrec: regB,
+                transposed: !transposedB
+              )
+
+              // Head masking: zero the register if this thread's head position >= D
+              if bNeedsMask {
+                ir += "  %\(bPrefix)hpos = add i32 %morton_y, \(headOffsetB)\n"
+                ir += "  %\(bPrefix)oob = icmp uge i32 %\(bPrefix)hpos, \(D)\n"
+                ir += "  %\(bPrefix)sram = select i1 %\(bPrefix)oob, \(irVecType(regB)) zeroinitializer, \(irVecType(regB)) %\(loadPrefix)sram\n"
+              }
             }
-            ir += generateTGLoad(
-              prefix: bPrefix,
-              tgOffset: "0",
-              rowOffset: "%\(bPrefix)row",
-              colOffset: "%\(bPrefix)col",
-              leadingBlockDim: leadingBlockDimB,
-              memPrec: memB,
-              regPrec: regB,
-              transposed: !transposedB
-            )
 
             let cIn = (k == 0) ? cNames[t] : "%\(ip)c_k\(k-1)_t\(t)"
             let cOut = "%\(ip)c_k\(k)_t\(t)"
@@ -424,29 +474,43 @@ extension AttentionKernel {
           // Use cached A register
           let aPrefix = "\(ip)a_k\(k)_"
           let cachedIdx = (Int(dOuterVal) + kOff) / 8
-          ir += "  %\(aPrefix)sram = bitcast \(irVecType(regA)) %cq_sram_\(cachedIdx) to \(irVecType(regA))\n"
+          ir += "  %\(aPrefix)sram = bitcast \(irVecType(regA)) %\(cachePrefix)sram_\(cachedIdx) to \(irVecType(regA))\n"
 
           // Load B tile(s) and multiply-accumulate
           for t in 0..<sSramCount {
             let tOff = t * 8
             let bPrefix = "\(ip)b_k\(k)_t\(t)_"
-            if transposedB {
-              ir += "  %\(bPrefix)row = add i32 %morton_y, \(kOff)\n"
-              ir += "  %\(bPrefix)col = add i32 %morton_x, \(tOff)\n"
+            let headOffsetB = Int(dOuterVal) + kOff
+            let bNeedsMask = needsHeadMaskB && headOffsetB + 8 > Int(D)
+
+            if needsHeadMaskB && headOffsetB >= D {
+              ir += "  %\(bPrefix)sram = bitcast \(irVecType(regB)) zeroinitializer to \(irVecType(regB))\n"
             } else {
-              ir += "  %\(bPrefix)row = add i32 %morton_x, \(tOff)\n"
-              ir += "  %\(bPrefix)col = add i32 %morton_y, \(kOff)\n"
+              let loadPrefix = bNeedsMask ? "\(bPrefix)raw_" : bPrefix
+              if transposedB {
+                ir += "  %\(loadPrefix)row = add i32 %morton_y, \(kOff)\n"
+                ir += "  %\(loadPrefix)col = add i32 %morton_x, \(tOff)\n"
+              } else {
+                ir += "  %\(loadPrefix)row = add i32 %morton_x, \(tOff)\n"
+                ir += "  %\(loadPrefix)col = add i32 %morton_y, \(kOff)\n"
+              }
+              ir += generateTGLoad(
+                prefix: loadPrefix,
+                tgOffset: "0",
+                rowOffset: "%\(loadPrefix)row",
+                colOffset: "%\(loadPrefix)col",
+                leadingBlockDim: leadingBlockDimB,
+                memPrec: memB,
+                regPrec: regB,
+                transposed: !transposedB
+              )
+
+              if bNeedsMask {
+                ir += "  %\(bPrefix)hpos = add i32 %morton_y, \(headOffsetB)\n"
+                ir += "  %\(bPrefix)oob = icmp uge i32 %\(bPrefix)hpos, \(D)\n"
+                ir += "  %\(bPrefix)sram = select i1 %\(bPrefix)oob, \(irVecType(regB)) zeroinitializer, \(irVecType(regB)) %\(loadPrefix)sram\n"
+              }
             }
-            ir += generateTGLoad(
-              prefix: bPrefix,
-              tgOffset: "0",
-              rowOffset: "%\(bPrefix)row",
-              colOffset: "%\(bPrefix)col",
-              leadingBlockDim: leadingBlockDimB,
-              memPrec: memB,
-              regPrec: regB,
-              transposed: !transposedB
-            )
 
             let cIn = (k == 0) ? cNames[t] : "%\(ip)c_k\(k-1)_t\(t)"
             let cOut = "%\(ip)c_k\(k)_t\(t)"
@@ -776,7 +840,8 @@ extension AttentionKernel {
     transposedB: Bool,
     cachedC: Bool,
     isFinalScale: Bool,
-    scaleCorrection: String  // SSA name of correction factor (or "" if none)
+    scaleCorrection: String,  // SSA name of correction factor (or "" if none)
+    aSourcePrefix: String = "sp_p"  // SSA prefix for A registers (e.g., "sp_p" → %sp_p_0)
   ) -> String {
     var ir = ""
     ir += "  ; === Accumulate \(C_name) += P * V ===\n"
@@ -868,7 +933,7 @@ extension AttentionKernel {
           )
 
           // Load P tile: P_sram[k] (traversal step k)
-          let pName = "%sp_p_\(kOff / 8)"
+          let pName = "%\(aSourcePrefix)_\(kOff / 8)"
 
           // Each d-accumulator chains independently across k-steps:
           //   k=0: cNames[accIdx] → c_k0_d{d}
@@ -942,6 +1007,22 @@ extension AttentionKernel {
 
     // Load directly from device memory into registers — no TG, no async copy,
     // no barriers. Matches reference pattern (preferAsyncCache=false on M1).
+    //
+    // Head dimension masking: each thread's morton_x determines which head
+    // column pair it loads. When morton_x * 2 + headOffset >= D, the load
+    // would access beyond the buffer. We must zero the register in that case.
+    // For non-transposed, the <2 x T> load reads columns [headOffset, headOffset+1].
+    // For transposed, the 2 scalar loads read rows [headOffset, headOffset+1].
+    // In both cases, headOffset = morton_x * 2 + dOuter + kOff (morton_x
+    // contributes ×2 because each thread holds 2 adjacent elements).
+
+    // Pre-compute head mask: morton_x * 2 (the thread's column pair start)
+    // We only need this if D < paddedD (there are head positions to mask)
+    let needsHeadMask = D < paddedD
+    if needsHeadMask {
+      ir += "  %\(p)mx2 = shl i32 %morton_x, 1\n"
+    }
+
     var dOuter: UInt32 = 0
     var iterIdx = 0
     while dOuter < paddedD {
@@ -954,9 +1035,17 @@ extension AttentionKernel {
         let regIdx = Int(dOuter) / 8 + k
         let lp = "\(ip)k\(k)_"
 
+        // Check at codegen time if this entire k-step is beyond D
+        let headStart = Int(dOuter) + kOff
+        if headStart >= D {
+          // Entire register is beyond D — just zero it
+          ir += "  %\(p)sram_\(regIdx) = bitcast \(irVecType(regPrec)) zeroinitializer to \(irVecType(regPrec))\n"
+          continue
+        }
+
         if transposed {
-          ir += "  %\(lp)seq = add i32 %oig_y, 0\n"
-          ir += "  %\(lp)head = add i32 %morton_x, \(Int(dOuter) + kOff)\n"
+          ir += "  %\(lp)seq = add i32 %clamped_par_off, 0\n"
+          ir += "  %\(lp)head = add i32 %morton_x, \(headStart)\n"
           ir += generateDeviceLoad(
             prefix: lp,
             bufferName: "%\(operand)",
@@ -968,8 +1057,8 @@ extension AttentionKernel {
             transposed: true
           )
         } else {
-          ir += "  %\(lp)seq = add i32 %oig_y, 0\n"
-          ir += "  %\(lp)head = add i32 %morton_x, \(Int(dOuter) + kOff)\n"
+          ir += "  %\(lp)seq = add i32 %clamped_par_off, 0\n"
+          ir += "  %\(lp)head = add i32 %morton_x, \(headStart)\n"
           ir += generateDeviceLoad(
             prefix: lp,
             bufferName: "%\(operand)",
@@ -981,7 +1070,17 @@ extension AttentionKernel {
             transposed: false
           )
         }
-        ir += "  %cq_sram_\(regIdx) = bitcast \(irVecType(regPrec)) %\(lp)sram to \(irVecType(regPrec))\n"
+
+        // Head masking: zero the register if this thread's head position >= D.
+        // headPos = morton_x * 2 + headStart. If headPos >= D, use zero.
+        if needsHeadMask && headStart + 8 > D {
+          // Some threads in this k-step may be out of bounds
+          ir += "  %\(lp)hpos = add i32 %\(p)mx2, \(headStart)\n"
+          ir += "  %\(lp)oob = icmp uge i32 %\(lp)hpos, \(D)\n"
+          ir += "  %\(p)sram_\(regIdx) = select i1 %\(lp)oob, \(irVecType(regPrec)) zeroinitializer, \(irVecType(regPrec)) %\(lp)sram\n"
+        } else {
+          ir += "  %\(p)sram_\(regIdx) = bitcast \(irVecType(regPrec)) %\(lp)sram to \(irVecType(regPrec))\n"
+        }
       }
 
       dOuter += UInt32(blockH)
@@ -1178,6 +1277,780 @@ extension AttentionKernel {
     ir += "  br label %\(p)skip_L\n\n"
 
     ir += "\(p)skip_L:\n"
+    ir += "  br label %exit\n"
+
+    return ir
+  }
+
+  // MARK: - Softmax from stored L (backward)
+
+  /// P = exp2(S * scaleFactor - L) where L is a per-row scalar (same for all traversal positions).
+  /// Used in backwardQuery where L was stored during the forward pass.
+  func generateSoftmaxFromL(
+    prefix p: String,
+    sSramCount: Int,
+    regS: GEMMOperandPrecision, regP: GEMMOperandPrecision,
+    scaleFactor: Float,
+    lScalar: String,  // SSA name of the L scalar (float)
+    sSource: String = "s_final"  // SSA prefix for S vectors (e.g., "s_final" → %s_final_0)
+  ) -> String {
+    let tS = irTypeName(regS)
+    let tP = irTypeName(regP)
+    var ir = ""
+
+    ir += "  ; === Softmax from L: P = exp2(S * scale - L) ===\n"
+
+    let scaleHex = "0x\(String(Double(scaleFactor).bitPattern, radix: 16, uppercase: true))"
+
+    for i in 0..<sSramCount {
+      ir += "  %\(p)s0_\(i) = extractelement \(irVecType(regS)) %\(sSource)_\(i), i32 0\n"
+      ir += "  %\(p)s1_\(i) = extractelement \(irVecType(regS)) %\(sSource)_\(i), i32 1\n"
+
+      let s0f = (regS == .FP32) ? "%\(p)s0_\(i)" : "%\(p)s0f_\(i)"
+      let s1f = (regS == .FP32) ? "%\(p)s1_\(i)" : "%\(p)s1f_\(i)"
+      if regS != .FP32 {
+        ir += "  \(s0f) = fpext \(tS) %\(p)s0_\(i) to float\n"
+        ir += "  \(s1f) = fpext \(tS) %\(p)s1_\(i) to float\n"
+      }
+
+      ir += "  %\(p)sc0_\(i) = fmul fast float \(s0f), \(scaleHex)\n"
+      ir += "  %\(p)sh0_\(i) = fsub fast float %\(p)sc0_\(i), \(lScalar)\n"
+      ir += irExp2Call(result: "%\(p)p0f_\(i)", value: "%\(p)sh0_\(i)") + "\n"
+
+      ir += "  %\(p)sc1_\(i) = fmul fast float \(s1f), \(scaleHex)\n"
+      ir += "  %\(p)sh1_\(i) = fsub fast float %\(p)sc1_\(i), \(lScalar)\n"
+      ir += irExp2Call(result: "%\(p)p1f_\(i)", value: "%\(p)sh1_\(i)") + "\n"
+
+      let p0 = (regP == .FP32) ? "%\(p)p0f_\(i)" : "%\(p)p0_\(i)"
+      let p1 = (regP == .FP32) ? "%\(p)p1f_\(i)" : "%\(p)p1_\(i)"
+      if regP != .FP32 {
+        ir += "  \(p0) = fptrunc float %\(p)p0f_\(i) to \(tP)\n"
+        ir += "  \(p1) = fptrunc float %\(p)p1f_\(i) to \(tP)\n"
+      }
+
+      ir += "  %\(p)pv0_\(i) = insertelement \(irVecType(regP)) undef, \(tP) \(p0), i32 0\n"
+      ir += "  %\(p)p_\(i) = insertelement \(irVecType(regP)) %\(p)pv0_\(i), \(tP) \(p1), i32 1\n"
+    }
+
+    return ir
+  }
+
+  /// P = exp2(S * scaleFactor - L) where L is a per-column <2 x float> vector.
+  /// Used in backwardKeyValue where L comes from the traversal dimension.
+  /// The L vector has element 0 for morton_x*2 and element 1 for morton_x*2+1.
+  /// P = exp2(S * scaleFactor - L) where L varies per-column of S^T.
+  /// Used in backwardKeyValue where each sSram tile covers different traversal rows,
+  /// so L must be loaded per-tile from the L buffer.
+  func generateSoftmaxFromLVector(
+    prefix p: String,
+    sSramCount: Int,
+    regS: GEMMOperandPrecision, regP: GEMMOperandPrecision,
+    scaleFactor: Float,
+    lBufferName: String,       // L buffer pointer (e.g., "%L_buf")
+    traversalOffset: String,   // loop variable for traversal offset (e.g., "%bkv_r")
+    traversalDim: UInt32,      // total traversal dimension (R)
+    memL: GEMMOperandPrecision,
+    sSource: String = "s_final"  // SSA prefix for S vectors
+  ) -> String {
+    let tS = irTypeName(regS)
+    let tP = irTypeName(regP)
+    let elemSizeL = UInt32(memL.size)
+    let memTypeL = irTypeName(memL)
+    var ir = ""
+
+    ir += "  ; === Softmax from L vector: P = exp2(S * scale - L) ===\n"
+
+    let scaleHex = "0x\(String(Double(scaleFactor).bitPattern, radix: 16, uppercase: true))"
+
+    for i in 0..<sSramCount {
+      // Load L for this tile's 2 traversal positions per thread
+      // Tile i covers columns i*8..(i+1)*8-1
+      // Thread sees columns: traversalOffset + i*8 + morton_x + {0,1}
+      // (morton_x is already {0,2,4,6}, NOT {0,1,2,3})
+      let tileOff = i * 8
+      ir += "  %\(p)tbase_\(i) = add i32 \(traversalOffset), \(tileOff)\n"
+      for elem in 0..<2 {
+        ir += "  %\(p)mxe_\(i)_\(elem) = add i32 %morton_x, \(elem)\n"
+        ir += "  %\(p)lidx_\(i)_\(elem) = add i32 %\(p)tbase_\(i), %\(p)mxe_\(i)_\(elem)\n"
+        // Clamp to bounds
+        ir += "  %\(p)lcmp_\(i)_\(elem) = icmp ult i32 %\(p)lidx_\(i)_\(elem), \(traversalDim)\n"
+        ir += "  %\(p)lsafe_\(i)_\(elem) = select i1 %\(p)lcmp_\(i)_\(elem), i32 %\(p)lidx_\(i)_\(elem), i32 \(traversalDim - 1)\n"
+        ir += "  %\(p)loff_\(i)_\(elem) = zext i32 %\(p)lsafe_\(i)_\(elem) to i64\n"
+        ir += "  %\(p)lbyte_\(i)_\(elem) = mul i64 %\(p)loff_\(i)_\(elem), \(elemSizeL)\n"
+        ir += "  %\(p)lptr_\(i)_\(elem) = getelementptr i8, i8 addrspace(1)* \(lBufferName), i64 %\(p)lbyte_\(i)_\(elem)\n"
+        ir += "  %\(p)ltyped_\(i)_\(elem) = bitcast i8 addrspace(1)* %\(p)lptr_\(i)_\(elem) to \(memTypeL) addrspace(1)*\n"
+        ir += "  %\(p)lraw_\(i)_\(elem) = load \(memTypeL), \(memTypeL) addrspace(1)* %\(p)ltyped_\(i)_\(elem)\n"
+        if memL != .FP32 {
+          ir += "  %\(p)L\(elem)_\(i) = fpext \(memTypeL) %\(p)lraw_\(i)_\(elem) to float\n"
+        } else {
+          ir += "  %\(p)L\(elem)_\(i) = bitcast float %\(p)lraw_\(i)_\(elem) to float\n"
+        }
+      }
+
+      ir += "  %\(p)s0_\(i) = extractelement \(irVecType(regS)) %\(sSource)_\(i), i32 0\n"
+      ir += "  %\(p)s1_\(i) = extractelement \(irVecType(regS)) %\(sSource)_\(i), i32 1\n"
+
+      let s0f = (regS == .FP32) ? "%\(p)s0_\(i)" : "%\(p)s0f_\(i)"
+      let s1f = (regS == .FP32) ? "%\(p)s1_\(i)" : "%\(p)s1f_\(i)"
+      if regS != .FP32 {
+        ir += "  \(s0f) = fpext \(tS) %\(p)s0_\(i) to float\n"
+        ir += "  \(s1f) = fpext \(tS) %\(p)s1_\(i) to float\n"
+      }
+
+      // P = exp2(S * scale - L)
+      // Each tile loads its own L values for the traversal positions it covers
+      ir += "  %\(p)sc0_\(i) = fmul fast float \(s0f), \(scaleHex)\n"
+      ir += "  %\(p)sh0_\(i) = fsub fast float %\(p)sc0_\(i), %\(p)L0_\(i)\n"
+      ir += irExp2Call(result: "%\(p)p0f_\(i)", value: "%\(p)sh0_\(i)") + "\n"
+
+      ir += "  %\(p)sc1_\(i) = fmul fast float \(s1f), \(scaleHex)\n"
+      ir += "  %\(p)sh1_\(i) = fsub fast float %\(p)sc1_\(i), %\(p)L1_\(i)\n"
+      ir += irExp2Call(result: "%\(p)p1f_\(i)", value: "%\(p)sh1_\(i)") + "\n"
+
+      let p0 = (regP == .FP32) ? "%\(p)p0f_\(i)" : "%\(p)p0_\(i)"
+      let p1 = (regP == .FP32) ? "%\(p)p1f_\(i)" : "%\(p)p1_\(i)"
+      if regP != .FP32 {
+        ir += "  \(p0) = fptrunc float %\(p)p0f_\(i) to \(tP)\n"
+        ir += "  \(p1) = fptrunc float %\(p)p1f_\(i) to \(tP)\n"
+      }
+
+      ir += "  %\(p)pv0_\(i) = insertelement \(irVecType(regP)) undef, \(tP) \(p0), i32 0\n"
+      ir += "  %\(p)p_\(i) = insertelement \(irVecType(regP)) %\(p)pv0_\(i), \(tP) \(p1), i32 1\n"
+    }
+
+    return ir
+  }
+
+  // MARK: - Derivative Softmax (backward)
+
+  /// dS = P * (dP - D_scalar) * derivScale
+  /// Used in backwardQuery where D is a per-row scalar (same for all traversal positions).
+  func generateDerivativeSoftmax(
+    prefix p: String,
+    sSramCount: Int,
+    regP: GEMMOperandPrecision, regdP: GEMMOperandPrecision,
+    regdS: GEMMOperandPrecision,
+    derivScale: Float,
+    dScalar: String,  // SSA name of D scalar (float)
+    pSource: String,  // SSA prefix for P vectors (e.g., "bq_sf_p" → %bq_sf_p_0)
+    dpSource: String  // SSA prefix for dP vectors (e.g., "dp_final" → %dp_final_0)
+  ) -> String {
+    let tP = irTypeName(regP)
+    let tdP = irTypeName(regdP)
+    let tdS = irTypeName(regdS)
+    var ir = ""
+
+    ir += "  ; === Derivative softmax: dS = P * (dP - D) * scale ===\n"
+
+    let scaleHex = "0x\(String(Double(derivScale).bitPattern, radix: 16, uppercase: true))"
+
+    for i in 0..<sSramCount {
+      // Extract P elements
+      ir += "  %\(p)p0_\(i) = extractelement \(irVecType(regP)) %\(pSource)_\(i), i32 0\n"
+      ir += "  %\(p)p1_\(i) = extractelement \(irVecType(regP)) %\(pSource)_\(i), i32 1\n"
+
+      // Extract dP elements
+      ir += "  %\(p)dp0_\(i) = extractelement \(irVecType(regdP)) %\(dpSource)_\(i), i32 0\n"
+      ir += "  %\(p)dp1_\(i) = extractelement \(irVecType(regdP)) %\(dpSource)_\(i), i32 1\n"
+
+      // Convert to float
+      let p0f = (regP == .FP32) ? "%\(p)p0_\(i)" : "%\(p)p0f_\(i)"
+      let p1f = (regP == .FP32) ? "%\(p)p1_\(i)" : "%\(p)p1f_\(i)"
+      let dp0f = (regdP == .FP32) ? "%\(p)dp0_\(i)" : "%\(p)dp0f_\(i)"
+      let dp1f = (regdP == .FP32) ? "%\(p)dp1_\(i)" : "%\(p)dp1f_\(i)"
+      if regP != .FP32 {
+        ir += "  \(p0f) = fpext \(tP) %\(p)p0_\(i) to float\n"
+        ir += "  \(p1f) = fpext \(tP) %\(p)p1_\(i) to float\n"
+      }
+      if regdP != .FP32 {
+        ir += "  \(dp0f) = fpext \(tdP) %\(p)dp0_\(i) to float\n"
+        ir += "  \(dp1f) = fpext \(tdP) %\(p)dp1_\(i) to float\n"
+      }
+
+      // dS = P * (dP - D) * derivScale
+      ir += "  %\(p)sub0_\(i) = fsub fast float \(dp0f), \(dScalar)\n"
+      ir += "  %\(p)pds0_\(i) = fmul fast float \(p0f), %\(p)sub0_\(i)\n"
+      ir += "  %\(p)ds0f_\(i) = fmul fast float %\(p)pds0_\(i), \(scaleHex)\n"
+
+      ir += "  %\(p)sub1_\(i) = fsub fast float \(dp1f), \(dScalar)\n"
+      ir += "  %\(p)pds1_\(i) = fmul fast float \(p1f), %\(p)sub1_\(i)\n"
+      ir += "  %\(p)ds1f_\(i) = fmul fast float %\(p)pds1_\(i), \(scaleHex)\n"
+
+      // Convert to dS precision and construct <64 x T>
+      let ds0 = (regdS == .FP32) ? "%\(p)ds0f_\(i)" : "%\(p)ds0_\(i)"
+      let ds1 = (regdS == .FP32) ? "%\(p)ds1f_\(i)" : "%\(p)ds1_\(i)"
+      if regdS != .FP32 {
+        ir += "  \(ds0) = fptrunc float %\(p)ds0f_\(i) to \(tdS)\n"
+        ir += "  \(ds1) = fptrunc float %\(p)ds1f_\(i) to \(tdS)\n"
+      }
+
+      ir += "  %\(p)dsv0_\(i) = insertelement \(irVecType(regdS)) undef, \(tdS) \(ds0), i32 0\n"
+      ir += "  %\(p)ds_\(i) = insertelement \(irVecType(regdS)) %\(p)dsv0_\(i), \(tdS) \(ds1), i32 1\n"
+    }
+
+    return ir
+  }
+
+  /// dS = P * (dP * derivScale - D_stored)
+  /// Used in backwardKeyValue where D varies per-column of S^T.
+  /// D_stored is already pre-scaled (D_raw * derivScale) from the bwd_q kernel.
+  /// Each sSram tile i covers traversal columns i*8..(i+1)*8-1, so each tile
+  /// needs different D values loaded from the D buffer.
+  func generateDerivativeSoftmaxVector(
+    prefix p: String,
+    sSramCount: Int,
+    regP: GEMMOperandPrecision, regdP: GEMMOperandPrecision,
+    regdS: GEMMOperandPrecision,
+    derivScale: Float,
+    dBufferName: String,       // D buffer pointer (e.g., "%D_buf")
+    traversalOffset: String,   // loop variable for traversal offset (e.g., "%bkv_r")
+    traversalDim: UInt32,      // total traversal dimension (R)
+    memD: GEMMOperandPrecision,
+    pSource: String,  // SSA prefix for P vectors (e.g., "bkv_sf_p" → %bkv_sf_p_0)
+    dpSource: String  // SSA prefix for dP vectors (e.g., "dp_final" → %dp_final_0)
+  ) -> String {
+    let tP = irTypeName(regP)
+    let tdP = irTypeName(regdP)
+    let tdS = irTypeName(regdS)
+    let elemSizeD = UInt32(memD.size)
+    let memTypeD = irTypeName(memD)
+    var ir = ""
+
+    ir += "  ; === Derivative softmax vector: dS = P * (dP * scale - D_stored) ===\n"
+
+    let scaleHex = "0x\(String(Double(derivScale).bitPattern, radix: 16, uppercase: true))"
+
+    for i in 0..<sSramCount {
+      // Load D for this tile's 2 traversal positions per thread
+      // Tile i covers columns i*8..(i+1)*8-1
+      // Thread sees columns: traversalOffset + i*8 + morton_x + {0,1}
+      // (morton_x is already {0,2,4,6}, NOT {0,1,2,3})
+      let tileOff = i * 8
+      ir += "  %\(p)tbase_\(i) = add i32 \(traversalOffset), \(tileOff)\n"
+      for elem in 0..<2 {
+        ir += "  %\(p)mxe_\(i)_\(elem) = add i32 %morton_x, \(elem)\n"
+        ir += "  %\(p)didx_\(i)_\(elem) = add i32 %\(p)tbase_\(i), %\(p)mxe_\(i)_\(elem)\n"
+        // Clamp to bounds
+        ir += "  %\(p)dcmp_\(i)_\(elem) = icmp ult i32 %\(p)didx_\(i)_\(elem), \(traversalDim)\n"
+        ir += "  %\(p)dsafe_\(i)_\(elem) = select i1 %\(p)dcmp_\(i)_\(elem), i32 %\(p)didx_\(i)_\(elem), i32 \(traversalDim - 1)\n"
+        ir += "  %\(p)doff_\(i)_\(elem) = zext i32 %\(p)dsafe_\(i)_\(elem) to i64\n"
+        ir += "  %\(p)dbyte_\(i)_\(elem) = mul i64 %\(p)doff_\(i)_\(elem), \(elemSizeD)\n"
+        ir += "  %\(p)dptr_\(i)_\(elem) = getelementptr i8, i8 addrspace(1)* \(dBufferName), i64 %\(p)dbyte_\(i)_\(elem)\n"
+        ir += "  %\(p)dtyped_\(i)_\(elem) = bitcast i8 addrspace(1)* %\(p)dptr_\(i)_\(elem) to \(memTypeD) addrspace(1)*\n"
+        ir += "  %\(p)draw_\(i)_\(elem) = load \(memTypeD), \(memTypeD) addrspace(1)* %\(p)dtyped_\(i)_\(elem)\n"
+        if memD != .FP32 {
+          ir += "  %\(p)D\(elem)_\(i) = fpext \(memTypeD) %\(p)draw_\(i)_\(elem) to float\n"
+        } else {
+          ir += "  %\(p)D\(elem)_\(i) = bitcast float %\(p)draw_\(i)_\(elem) to float\n"
+        }
+      }
+
+      ir += "  %\(p)p0_\(i) = extractelement \(irVecType(regP)) %\(pSource)_\(i), i32 0\n"
+      ir += "  %\(p)p1_\(i) = extractelement \(irVecType(regP)) %\(pSource)_\(i), i32 1\n"
+
+      ir += "  %\(p)dp0_\(i) = extractelement \(irVecType(regdP)) %\(dpSource)_\(i), i32 0\n"
+      ir += "  %\(p)dp1_\(i) = extractelement \(irVecType(regdP)) %\(dpSource)_\(i), i32 1\n"
+
+      let p0f = (regP == .FP32) ? "%\(p)p0_\(i)" : "%\(p)p0f_\(i)"
+      let p1f = (regP == .FP32) ? "%\(p)p1_\(i)" : "%\(p)p1f_\(i)"
+      let dp0f = (regdP == .FP32) ? "%\(p)dp0_\(i)" : "%\(p)dp0f_\(i)"
+      let dp1f = (regdP == .FP32) ? "%\(p)dp1_\(i)" : "%\(p)dp1f_\(i)"
+      if regP != .FP32 {
+        ir += "  \(p0f) = fpext \(tP) %\(p)p0_\(i) to float\n"
+        ir += "  \(p1f) = fpext \(tP) %\(p)p1_\(i) to float\n"
+      }
+      if regdP != .FP32 {
+        ir += "  \(dp0f) = fpext \(tdP) %\(p)dp0_\(i) to float\n"
+        ir += "  \(dp1f) = fpext \(tdP) %\(p)dp1_\(i) to float\n"
+      }
+
+      // dS = P * (dP * scale - D_stored)
+      // D_stored is already D_raw * derivScale, so scale dP to match
+      ir += "  %\(p)sdp0_\(i) = fmul fast float \(dp0f), \(scaleHex)\n"
+      ir += "  %\(p)sub0_\(i) = fsub fast float %\(p)sdp0_\(i), %\(p)D0_\(i)\n"
+      ir += "  %\(p)ds0f_\(i) = fmul fast float \(p0f), %\(p)sub0_\(i)\n"
+
+      ir += "  %\(p)sdp1_\(i) = fmul fast float \(dp1f), \(scaleHex)\n"
+      ir += "  %\(p)sub1_\(i) = fsub fast float %\(p)sdp1_\(i), %\(p)D1_\(i)\n"
+      ir += "  %\(p)ds1f_\(i) = fmul fast float \(p1f), %\(p)sub1_\(i)\n"
+
+      let ds0 = (regdS == .FP32) ? "%\(p)ds0f_\(i)" : "%\(p)ds0_\(i)"
+      let ds1 = (regdS == .FP32) ? "%\(p)ds1f_\(i)" : "%\(p)ds1_\(i)"
+      if regdS != .FP32 {
+        ir += "  \(ds0) = fptrunc float %\(p)ds0f_\(i) to \(tdS)\n"
+        ir += "  \(ds1) = fptrunc float %\(p)ds1f_\(i) to \(tdS)\n"
+      }
+
+      ir += "  %\(p)dsv0_\(i) = insertelement \(irVecType(regdS)) undef, \(tdS) \(ds0), i32 0\n"
+      ir += "  %\(p)ds_\(i) = insertelement \(irVecType(regdS)) %\(p)dsv0_\(i), \(tdS) \(ds1), i32 1\n"
+    }
+
+    return ir
+  }
+
+  // MARK: - Compute D = sum(dO * O)
+
+  /// Compute D = reduce_sum(dO[row,:] * O[row,:])
+  /// Both dO and O are loaded from device (or dO from cache).
+  /// Result: %D_sram (float scalar per thread, reduced across head dim).
+  func generateComputeD(
+    prefix p: String,
+    D: UInt32, paddedD: UInt32, blockH: UInt16,
+    headLoopFloor: UInt32, headEdge: UInt32,
+    parallelDim: UInt32,
+    cachedO: Bool, cacheddO: Bool,
+    leadingDimO: UInt32, leadingDimdO: UInt32,
+    memO: GEMMOperandPrecision, regO: GEMMOperandPrecision,
+    memdO: GEMMOperandPrecision, regdO: GEMMOperandPrecision,
+    transposedO: Bool, transposeddO: Bool
+  ) -> String {
+    var ir = ""
+    ir += "  ; === Compute D = sum(dO * O) ===\n"
+
+    // Accumulate dO * O elementwise across the head dimension
+    ir += "  ; D_acc = sum over d of (dO[row,d] * O[row,d])\n"
+
+    var accName = "0.0"  // running float accumulator for element 0+1
+
+    var dOuter: UInt32 = 0
+    var iterIdx = 0
+    while dOuter < paddedD {
+      let regSize = min(UInt32(blockH), paddedD - dOuter)
+      let kSteps = Int(regSize / 8)
+
+      for k in 0..<kSteps {
+        let kOff = k * 8
+        let headStart = Int(dOuter) + kOff
+        let ip = "\(p)d\(iterIdx)_k\(k)_"
+
+        // Skip if beyond D
+        if headStart >= D {
+          continue
+        }
+
+        // Load O from device
+        ir += "  %\(ip)o_seq = add i32 %clamped_par_off, 0\n"
+        ir += "  %\(ip)o_head = add i32 %morton_x, \(headStart)\n"
+        ir += generateDeviceLoad(
+          prefix: "\(ip)o_",
+          bufferName: "%O",
+          seqOffset: "%\(ip)o_seq",
+          headOffset: "%\(ip)o_head",
+          leadingDim: leadingDimO,
+          memPrec: memO,
+          regPrec: regO,
+          transposed: transposedO
+        )
+
+        // Load dO from cache or device
+        if cacheddO {
+          let cacheIdx = Int(dOuter) / 8 + k
+          ir += "  %\(ip)do_sram = bitcast \(irVecType(regdO)) %cdo_sram_\(cacheIdx) to \(irVecType(regdO))\n"
+        } else {
+          ir += "  %\(ip)do_seq = add i32 %clamped_par_off, 0\n"
+          ir += "  %\(ip)do_head = add i32 %morton_x, \(headStart)\n"
+          ir += generateDeviceLoad(
+            prefix: "\(ip)do_",
+            bufferName: "%dO",
+            seqOffset: "%\(ip)do_seq",
+            headOffset: "%\(ip)do_head",
+            leadingDim: leadingDimdO,
+            memPrec: memdO,
+            regPrec: regdO,
+            transposed: transposeddO
+          )
+        }
+
+        // Extract elements and multiply
+        ir += "  %\(ip)o0 = extractelement \(irVecType(regO)) %\(ip)o_sram, i32 0\n"
+        ir += "  %\(ip)o1 = extractelement \(irVecType(regO)) %\(ip)o_sram, i32 1\n"
+        ir += "  %\(ip)do0 = extractelement \(irVecType(regdO)) %\(ip)do_sram, i32 0\n"
+        ir += "  %\(ip)do1 = extractelement \(irVecType(regdO)) %\(ip)do_sram, i32 1\n"
+
+        // Convert to float if needed
+        let o0f = (regO == .FP32) ? "%\(ip)o0" : "%\(ip)o0f"
+        let o1f = (regO == .FP32) ? "%\(ip)o1" : "%\(ip)o1f"
+        let do0f = (regdO == .FP32) ? "%\(ip)do0" : "%\(ip)do0f"
+        let do1f = (regdO == .FP32) ? "%\(ip)do1" : "%\(ip)do1f"
+        if regO != .FP32 {
+          ir += "  \(o0f) = fpext \(irTypeName(regO)) %\(ip)o0 to float\n"
+          ir += "  \(o1f) = fpext \(irTypeName(regO)) %\(ip)o1 to float\n"
+        }
+        if regdO != .FP32 {
+          ir += "  \(do0f) = fpext \(irTypeName(regdO)) %\(ip)do0 to float\n"
+          ir += "  \(do1f) = fpext \(irTypeName(regdO)) %\(ip)do1 to float\n"
+        }
+
+        // Multiply and accumulate
+        ir += "  %\(ip)prod0_raw = fmul fast float \(do0f), \(o0f)\n"
+        ir += "  %\(ip)prod1_raw = fmul fast float \(do1f), \(o1f)\n"
+
+        // Head masking: zero products for threads whose head position >= D
+        // Device load gives positions [morton_x + headStart, morton_x + headStart + 1]
+        // morton_x is always even (0, 2, 4, 6, ...), so element 0 is at
+        // morton_x + headStart, element 1 is at morton_x + headStart + 1.
+        if headStart + 8 > Int(D) {
+          ir += "  %\(ip)hpos0 = add i32 %morton_x, \(headStart)\n"
+          ir += "  %\(ip)hpos1 = add i32 %morton_x, \(headStart + 1)\n"
+          ir += "  %\(ip)oob0 = icmp uge i32 %\(ip)hpos0, \(D)\n"
+          ir += "  %\(ip)oob1 = icmp uge i32 %\(ip)hpos1, \(D)\n"
+          ir += "  %\(ip)prod0 = select i1 %\(ip)oob0, float 0.0, float %\(ip)prod0_raw\n"
+          ir += "  %\(ip)prod1 = select i1 %\(ip)oob1, float 0.0, float %\(ip)prod1_raw\n"
+        } else {
+          ir += "  %\(ip)prod0 = bitcast float %\(ip)prod0_raw to float\n"
+          ir += "  %\(ip)prod1 = bitcast float %\(ip)prod1_raw to float\n"
+        }
+
+        ir += "  %\(ip)sum01 = fadd fast float %\(ip)prod0, %\(ip)prod1\n"
+        ir += "  %\(ip)acc = fadd fast float \(accName), %\(ip)sum01\n"
+        accName = "%\(ip)acc"
+      }
+
+      dOuter += UInt32(blockH)
+      iterIdx += 1
+    }
+
+    // If no iterations happened (D=0?), set to 0
+    if accName == "0.0" {
+      ir += "  %\(p)final_acc = bitcast float 0.0 to float\n"
+      accName = "%\(p)final_acc"
+    }
+
+    // SIMD reduction: shuffle_xor with masks 1 and 8
+    ir += irShuffleXorCall(result: "%\(p)shuf1", value: accName, mask: 1) + "\n"
+    ir += "  %\(p)sum_s1 = fadd fast float \(accName), %\(p)shuf1\n"
+    ir += irShuffleXorCall(result: "%\(p)shuf8", value: "%\(p)sum_s1", mask: 8) + "\n"
+    ir += "  %\(p)sum_s8 = fadd fast float %\(p)sum_s1, %\(p)shuf8\n"
+
+    // D_sram = raw sum(dO * O) — no scaling here.
+    // The derivative softmax formula dS = P * (dP * derivScale - D) handles
+    // the scale factor on dP, not on D.
+    ir += "  %D_sram = bitcast float %\(p)sum_s8 to float\n"
+
+    return ir
+  }
+
+  // MARK: - Load Traversal Scalar (L or D for bkv)
+
+  /// Load a per-row scalar from device memory for each thread's traversal position.
+  /// In bkv, the traversal dimension is R, so we load L[r + morton_x*2] and L[r + morton_x*2+1].
+  /// Result: a <2 x float> with one L/D value per thread element.
+  func generateLoadTraversalScalar(
+    prefix p: String,
+    bufferName: String,
+    resultName: String,
+    traversalOffset: String,
+    traversalDim: UInt32,
+    blockT: UInt16,
+    memPrec: GEMMOperandPrecision
+  ) -> String {
+    let elemSize = UInt32(memPrec.size)
+    let memType = irTypeName(memPrec)
+    var ir = ""
+
+    ir += "  ; === Load traversal scalar from \(bufferName) ===\n"
+
+    // Each thread loads 2 scalar values for its morton_x positions.
+    // Thread position in traversal = traversalOffset + morton_x + {0, 1}
+    // (morton_x is already {0,2,4,6}, NOT {0,1,2,3})
+    for elem in 0..<2 {
+      ir += "  %\(p)mx_\(elem) = add i32 %morton_x, \(elem)\n"
+      ir += "  %\(p)idx_\(elem) = add i32 \(traversalOffset), %\(p)mx_\(elem)\n"
+
+      // Clamp to bounds
+      ir += "  %\(p)cmp_\(elem) = icmp ult i32 %\(p)idx_\(elem), \(traversalDim)\n"
+      ir += "  %\(p)dim_m1_\(elem) = sub i32 \(traversalDim), 1\n"
+      ir += "  %\(p)safe_\(elem) = select i1 %\(p)cmp_\(elem), i32 %\(p)idx_\(elem), i32 %\(p)dim_m1_\(elem)\n"
+
+      ir += "  %\(p)off64_\(elem) = zext i32 %\(p)safe_\(elem) to i64\n"
+      ir += "  %\(p)byte_\(elem) = mul i64 %\(p)off64_\(elem), \(elemSize)\n"
+      ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(1)* \(bufferName), i64 %\(p)byte_\(elem)\n"
+      ir += "  %\(p)typed_\(elem) = bitcast i8 addrspace(1)* %\(p)ptr_\(elem) to \(memType) addrspace(1)*\n"
+      ir += "  %\(p)raw_\(elem) = load \(memType), \(memType) addrspace(1)* %\(p)typed_\(elem)\n"
+
+      if memPrec != .FP32 {
+        ir += "  %\(p)val_\(elem) = fpext \(memType) %\(p)raw_\(elem) to float\n"
+      } else {
+        ir += "  %\(p)val_\(elem) = bitcast float %\(p)raw_\(elem) to float\n"
+      }
+    }
+
+    // Construct <2 x float>
+    ir += "  %\(p)v0 = insertelement <2 x float> undef, float %\(p)val_0, i32 0\n"
+    ir += "  \(resultName) = insertelement <2 x float> %\(p)v0, float %\(p)val_1, i32 1\n"
+
+    return ir
+  }
+
+  // MARK: - Cache Store (registers → TG → device)
+
+  /// Store cached registers to device memory via TG + async copy.
+  /// Same pattern as generateForwardCleanup O store, but parameterized.
+  func generateCacheStore(
+    operand: AttentionOperand,
+    prefix p: String,
+    regCount: Int,
+    blockP: UInt16, blockH: UInt16,
+    D: UInt32, paddedD: UInt32, headEdge: UInt32,
+    headLoopFloor: UInt32,
+    parallelDim: UInt32,
+    regPrec: GEMMOperandPrecision, memPrec: GEMMOperandPrecision,
+    leadingDim: UInt32, leadingBlockDim: UInt32,
+    transposed: Bool,
+    phiPrefix: String  // prefix for the phi name of the accumulators (e.g., "dq_phi")
+  ) -> String {
+    let elemSize = UInt32(memPrec.size)
+    let tReg = irTypeName(regPrec)
+    var ir = ""
+
+    ir += "  ; === Cache store \(operand) ===\n"
+
+    var dOuter: UInt32 = 0
+    var iterIdx = 0
+    while dOuter < paddedD {
+      let regSize = min(UInt32(blockH), paddedD - dOuter)
+      let ip = "\(p)st\(iterIdx)_"
+      let kSteps = Int(regSize / 8)
+
+      // Store registers to TG
+      for k in 0..<kSteps {
+        let kOff = k * 8
+        let regIdx = Int(dOuter) / 8 + k
+        let sp = "\(ip)k\(k)_"
+
+        // Unshuffle from <64 x T> to <2 x T>
+        ir += irShuffleFromVec64(
+          result: "%\(sp)v2", src: "%\(phiPrefix)_\(regIdx)", type: regPrec
+        ) + "\n"
+
+        // Convert precision if needed
+        let storeVec: String
+        let storeType: String
+        if regPrec != memPrec {
+          let memT = irTypeName(memPrec)
+          ir += "  %\(sp)se0 = extractelement <2 x \(tReg)> %\(sp)v2, i32 0\n"
+          ir += "  %\(sp)se1 = extractelement <2 x \(tReg)> %\(sp)v2, i32 1\n"
+          ir += "  %\(sp)st0 = fptrunc \(tReg) %\(sp)se0 to \(memT)\n"
+          ir += "  %\(sp)st1 = fptrunc \(tReg) %\(sp)se1 to \(memT)\n"
+          ir += "  %\(sp)sv0 = insertelement <2 x \(memT)> undef, \(memT) %\(sp)st0, i32 0\n"
+          ir += "  %\(sp)svec = insertelement <2 x \(memT)> %\(sp)sv0, \(memT) %\(sp)st1, i32 1\n"
+          storeVec = "%\(sp)svec"
+          storeType = memT
+        } else {
+          storeVec = "%\(sp)v2"
+          storeType = tReg
+        }
+
+        // TG address
+        if transposed {
+          ir += "  %\(sp)tg_row = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDim)\n"
+          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %oig_y\n"
+        } else {
+          ir += "  %\(sp)tg_row = add i32 %oig_y, 0\n"
+          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDim)\n"
+          ir += "  %\(sp)tg_col = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %\(sp)tg_col\n"
+        }
+        ir += "  %\(sp)tg_byte = mul i32 %\(sp)tg_addr2, \(elemSize)\n"
+        ir += "  %\(sp)tg_byte64 = zext i32 %\(sp)tg_byte to i64\n"
+        ir += "  %\(sp)tg_ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte64\n"
+        ir += "  %\(sp)tg_typed = bitcast i8 addrspace(3)* %\(sp)tg_ptr to <2 x \(storeType)> addrspace(3)*\n"
+
+        ir += "  %\(sp)in_bounds = icmp ult i32 %unsafe_par_off, \(parallelDim)\n"
+        ir += "  br i1 %\(sp)in_bounds, label %\(sp)do_store, label %\(sp)skip_store\n\n"
+        ir += "\(sp)do_store:\n"
+        ir += "  store <2 x \(storeType)> \(storeVec), <2 x \(storeType)> addrspace(3)* %\(sp)tg_typed\n"
+        ir += "  br label %\(sp)skip_store\n\n"
+        ir += "\(sp)skip_store:\n"
+      }
+
+      ir += "  call void @air.wg.barrier(i32 2, i32 1)\n"
+
+      // Async copy TG → device
+      let cp = "\(ip)cp_"
+      ir += "  br i1 %is_sidx0, label %\(cp)do, label %\(cp)skip\n\n"
+      ir += "\(cp)do:\n"
+
+      if transposed {
+        ir += "  %\(cp)dev_row = mul i32 \(dOuter), \(leadingDim)\n"
+        ir += "  %\(cp)dev_off32 = add i32 %\(cp)dev_row, %par_group_off\n"
+      } else {
+        ir += "  %\(cp)dev_row = mul i32 %par_group_off, \(leadingDim)\n"
+        ir += "  %\(cp)dev_off32 = add i32 %\(cp)dev_row, \(dOuter)\n"
+      }
+      ir += "  %\(cp)dev_off = zext i32 %\(cp)dev_off32 to i64\n"
+      ir += "  %\(cp)dev_byte = mul i64 %\(cp)dev_off, \(elemSize)\n"
+      ir += "  %\(cp)dst_p = getelementptr i8, i8 addrspace(1)* %\(operand), i64 %\(cp)dev_byte\n"
+      ir += "  %\(cp)src_p = getelementptr i8, i8 addrspace(3)* %tg_base, i64 0\n"
+
+      let dTile = min(UInt32(blockH), D - min(dOuter, D))
+      ir += "  %\(cp)seq_rem = sub i32 \(parallelDim), %par_group_off\n"
+      ir += "  %\(cp)seq_cmp = icmp ult i32 %\(cp)seq_rem, \(blockP)\n"
+      ir += "  %\(cp)seq_tile32 = select i1 %\(cp)seq_cmp, i32 %\(cp)seq_rem, i32 \(blockP)\n"
+      ir += "  %\(cp)seq_tile = zext i32 %\(cp)seq_tile32 to i64\n"
+
+      let dstStride = leadingDim * elemSize
+      let srcStride = leadingBlockDim * elemSize
+
+      let (tileW, tileH): (String, String)
+      if transposed {
+        ir += "  %\(cp)w_bytes32 = mul i32 %\(cp)seq_tile32, \(elemSize)\n"
+        ir += "  %\(cp)w_bytes = zext i32 %\(cp)w_bytes32 to i64\n"
+        tileW = "%\(cp)w_bytes"
+        tileH = "\(dTile)"
+      } else {
+        tileW = "\(dTile * elemSize)"
+        tileH = "%\(cp)seq_tile"
+      }
+
+      ir += "  %\(cp)tile_w = insertelement <2 x i64> zeroinitializer, i64 \(tileW), i32 0\n"
+      ir += "  %\(cp)tile = insertelement <2 x i64> %\(cp)tile_w, i64 \(tileH), i32 1\n"
+
+      ir += "  %\(cp)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
+      ir += """
+        %\(cp)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p1i8.p3i8(
+          i64 1, i64 1,
+          i8 addrspace(1)* %\(cp)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(cp)tile,
+          i8 addrspace(3)* %\(cp)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(cp)tile,
+          <2 x i64> zeroinitializer, i32 0
+        )
+        store %event_t addrspace(3)* %\(cp)ev, %event_t addrspace(3)** %\(cp)evp
+        call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(cp)evp)
+
+      """
+
+      ir += "  br label %\(cp)skip\n\n"
+      ir += "\(cp)skip:\n"
+      ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+
+      dOuter += UInt32(blockH)
+      iterIdx += 1
+    }
+
+    return ir
+  }
+
+  // MARK: - Backward Query Cleanup
+
+  func generateBackwardQueryCleanup(
+    prefix p: String,
+    dqCount: Int,
+    blockP: UInt16, blockH: UInt16,
+    D: UInt32, paddedD: UInt32, headEdge: UInt32,
+    headLoopFloor: UInt32,
+    parallelDim: UInt32,
+    regdQ: GEMMOperandPrecision, memdQ: GEMMOperandPrecision,
+    memD: GEMMOperandPrecision,
+    leadingDimdQ: UInt32, leadingBlockDimdQ: UInt32,
+    transposeddQ: Bool,
+    cacheddQ: Bool,
+    derivScale: Float
+  ) -> String {
+    let elemSizeD = UInt32(memD.size)
+    var ir = ""
+
+    ir += """
+
+    bq_cleanup:
+      ; === Backward Query cleanup: store dQ, store D ===
+
+    """
+
+    // Store dQ via cache store
+    ir += generateCacheStore(
+      operand: .dQ,
+      prefix: "\(p)dq_",
+      regCount: dqCount,
+      blockP: blockP, blockH: blockH,
+      D: D, paddedD: paddedD, headEdge: headEdge,
+      headLoopFloor: headLoopFloor,
+      parallelDim: parallelDim,
+      regPrec: regdQ, memPrec: memdQ,
+      leadingDim: leadingDimdQ, leadingBlockDim: leadingBlockDimdQ,
+      transposed: transposeddQ,
+      phiPrefix: "dq_phi"
+    )
+
+    // Store D scalar to device (scaled by derivScale for compatibility with
+    // the reference Metal source, which stores D * derivScale and uses
+    // dS = P * (dP * scale - D_stored). Our kernel uses D_sram raw internally
+    // with dS = P * (dP - D_sram) * scale, but the test expects scaled D.)
+    let dScaleHex = "0x\(String(Double(derivScale).bitPattern, radix: 16, uppercase: true))"
+    ir += "  ; Store D (scaled by derivScale)\n"
+    ir += "  %\(p)D_scaled = fmul fast float %D_sram, \(dScaleHex)\n"
+    ir += "  %\(p)D_in_bounds = icmp ult i32 %unsafe_par_off, \(parallelDim)\n"
+    ir += "  br i1 %\(p)D_in_bounds, label %\(p)store_D, label %\(p)skip_D\n\n"
+
+    ir += "\(p)store_D:\n"
+    ir += "  %\(p)D_off = zext i32 %clamped_par_off to i64\n"
+    ir += "  %\(p)D_byte = mul i64 %\(p)D_off, \(elemSizeD)\n"
+    ir += "  %\(p)D_ptr = getelementptr i8, i8 addrspace(1)* %D_buf, i64 %\(p)D_byte\n"
+    ir += "  %\(p)D_typed = bitcast i8 addrspace(1)* %\(p)D_ptr to float addrspace(1)*\n"
+    ir += "  store float %\(p)D_scaled, float addrspace(1)* %\(p)D_typed\n"
+    ir += "  br label %\(p)skip_D\n\n"
+
+    ir += "\(p)skip_D:\n"
+    ir += "  br label %exit\n"
+
+    return ir
+  }
+
+  // MARK: - Backward Key-Value Cleanup
+
+  func generateBackwardKeyValueCleanup(
+    prefix p: String,
+    dkCount: Int, dvCount: Int,
+    blockP: UInt16, blockH: UInt16,
+    D: UInt32, paddedD: UInt32, headEdge: UInt32,
+    headLoopFloor: UInt32,
+    parallelDim: UInt32,
+    regdK: GEMMOperandPrecision, memdK: GEMMOperandPrecision,
+    regdV: GEMMOperandPrecision, memdV: GEMMOperandPrecision,
+    leadingDimdK: UInt32, leadingBlockDimdK: UInt32,
+    leadingDimdV: UInt32, leadingBlockDimdV: UInt32,
+    transposeddK: Bool, transposeddV: Bool,
+    cacheddK: Bool, cacheddV: Bool
+  ) -> String {
+    var ir = ""
+
+    ir += """
+
+    bkv_cleanup:
+      ; === Backward Key-Value cleanup: store dK, store dV ===
+
+    """
+
+    // Store dV via cache store
+    ir += generateCacheStore(
+      operand: .dV,
+      prefix: "\(p)dv_",
+      regCount: dvCount,
+      blockP: blockP, blockH: blockH,
+      D: D, paddedD: paddedD, headEdge: headEdge,
+      headLoopFloor: headLoopFloor,
+      parallelDim: parallelDim,
+      regPrec: regdV, memPrec: memdV,
+      leadingDim: leadingDimdV, leadingBlockDim: leadingBlockDimdV,
+      transposed: transposeddV,
+      phiPrefix: "dv_phi"
+    )
+
+    // Store dK via cache store
+    ir += generateCacheStore(
+      operand: .dK,
+      prefix: "\(p)dk_",
+      regCount: dkCount,
+      blockP: blockP, blockH: blockH,
+      D: D, paddedD: paddedD, headEdge: headEdge,
+      headLoopFloor: headLoopFloor,
+      parallelDim: parallelDim,
+      regPrec: regdK, memPrec: memdK,
+      leadingDim: leadingDimdK, leadingBlockDim: leadingBlockDimdK,
+      transposed: transposeddK,
+      phiPrefix: "dk_phi"
+    )
+
     ir += "  br label %exit\n"
 
     return ir
