@@ -5,6 +5,10 @@
 //  Forward attention kernel IR generation.
 //  S = Q * K^T, softmax, O += P * V, O /= l, store L.
 //
+//  Double-buffered: K uses TG slot A (offset 0), V uses TG slot B (offset slotSize).
+//  V[d_outer=0] copy overlaps with S = Q*K^T computation.
+//  K[i+1, d_outer=0] copy overlaps with O += P*V computation.
+//
 
 extension AttentionKernel {
 
@@ -48,6 +52,14 @@ extension AttentionKernel {
       oCount = Int(blockH / 8)
     }
 
+    // TG slot offsets for double-buffering
+    let slotSize = Int(forwardTGSlotSize)
+    let slotA = "0"           // K slot
+    let slotB = "\(slotSize)" // V slot
+
+    // First head block size for prefetch
+    let firstBlockHead = min(UInt16(D), blockH)
+
     // MARK: - Setup
 
     // Initialize O accumulators to zero
@@ -72,13 +84,31 @@ extension AttentionKernel {
       )
     }
 
+    // MARK: - Prologue: Prefetch K[0, d_outer=0] → TG slot A
+
+    ir += "  ; === Prologue: prefetch K[0, d_outer=0] → TG slot A ===\n"
+    ir += generateAsyncCopyDeviceToTG(
+      prefix: "pre_k_",
+      buffer: "%K",
+      operand: .K,
+      dOuter: "0",
+      seqOffset: "0",
+      seqDim: traversalDim,
+      blockSeq: blockT,
+      blockHead: firstBlockHead,
+      D: D,
+      leadingDim: leadingDim(.K),
+      leadingBlockDim: leadingBlockDim(.K),
+      memPrec: memK,
+      transposed: transposed(.K),
+      tgOffset: slotA
+    )
+
     // MARK: - Traversal Loop
 
-    // Use a dedicated label so phi predecessors are correct even when
-    // cache-load inserts extra basic blocks between valid_group and here.
     ir += """
 
-      ; === Traversal loop ===
+      ; === Traversal loop (double-buffered) ===
       br label %before_loop
     before_loop:
       br label %loop_header
@@ -104,19 +134,37 @@ extension AttentionKernel {
 
     """
 
-    // MARK: - Outer Product (S = Q * K^T)
+    // MARK: - Start V[c, d_outer=0] copy → TG slot B (overlaps with S compute)
+
+    ir += "  ; === Start V[c, d_outer=0] → TG slot B (no wait) ===\n"
+    ir += generateAsyncCopyStart(
+      prefix: "pv_",
+      buffer: "%V",
+      operand: .V,
+      dOuter: "0",
+      seqOffset: "%c",
+      seqDim: traversalDim,
+      blockSeq: blockT,
+      blockHead: firstBlockHead,
+      D: D,
+      leadingDim: leadingDim(.V),
+      leadingBlockDim: leadingBlockDim(.V),
+      memPrec: memV,
+      transposed: transposed(.V),
+      tgOffset: slotB,
+      eventSlot: 1
+    )
+
+    // MARK: - Outer Product (S = Q * K^T) — K already in TG slot A
 
     // Initialize S accumulators to zero
     for i in 0..<sSramCount {
       ir += "  \(irZeroVec64(result: "%s_init_\(i)", precision: regS))\n"
     }
 
-    // Loop over head dimension (d_outer)
-    // For each d_outer block, we:
-    //   1. Load K from device → TG (async copy)
-    //   2. Barrier
-    //   3. Load Q (from cached registers or device/TG)
-    //   4. Multiply: S += Q_block * K_block^T
+    // K[c, d_outer=0] is already in TG slot A (from prologue or previous iter's prefetch).
+    // skipFirstIterCopy=true: first d_outer iteration skips async copy.
+    // Subsequent d_outer iterations still do their own copies to slot A.
     ir += generateOuterProduct(
       prefix: "op_",
       A: .Q, B: .K, C_name: "s",
@@ -130,8 +178,15 @@ extension AttentionKernel {
       memA: memQ, memB: memK,
       leadingDimA: leadingDim(.Q), leadingDimB: leadingDim(.K),
       leadingBlockDimA: leadingBlockDim(.Q), leadingBlockDimB: leadingBlockDim(.K),
-      cachedA: isCachedQ, transposedA: transposed(.Q), transposedB: transposed(.K)
+      cachedA: isCachedQ, transposedA: transposed(.Q), transposedB: transposed(.K),
+      tgOffset: slotA,
+      skipFirstIterCopy: true
     )
+
+    // MARK: - Wait for V copy to complete
+
+    ir += "  ; === Wait for V[c, d_outer=0] copy ===\n"
+    ir += generateAsyncCopyWait(prefix: "wv_", eventSlot: 1)
 
     // MARK: - Mask Attention Matrix Edge
 
@@ -176,8 +231,11 @@ extension AttentionKernel {
       regP: regP
     )
 
-    // MARK: - Accumulate O += P * V
+    // MARK: - Accumulate O += P * V — V already in TG slot B
 
+    // V[c, d_outer=0] is already in TG slot B (waited above).
+    // skipFirstIterCopy=true: first d_outer iteration skips async copy.
+    // Subsequent d_outer iterations still do their own copies to slot B.
     ir += generateAccumulate(
       prefix: "acc_",
       A: .P, B: .V, C_name: "o",
@@ -194,28 +252,60 @@ extension AttentionKernel {
       transposedB: transposed(.V),
       cachedC: isCachedO,
       isFinalScale: false,
-      scaleCorrection: "corr_correction"
+      scaleCorrection: "corr_correction",
+      tgOffset: slotB,
+      skipFirstIterCopy: true
     )
+
+    // MARK: - Prefetch K[c+blockT, d_outer=0] → TG slot A (overlaps with loop overhead)
+
+    // Use zero-height trick on last iteration to avoid conditional branches.
+    // When c+blockT >= C, the seq dimension remaining is 0, so async_copy is a no-op.
+    ir += """
+
+      ; === Prefetch K[c+blockT, d_outer=0] → TG slot A ===
+      %c_next = add i32 %c, \(blockT)
+
+    """
+
+    ir += generateAsyncCopyStart(
+      prefix: "pk_",
+      buffer: "%K",
+      operand: .K,
+      dOuter: "0",
+      seqOffset: "%c_next",
+      seqDim: traversalDim,
+      blockSeq: blockT,
+      blockHead: firstBlockHead,
+      D: D,
+      leadingDim: leadingDim(.K),
+      leadingBlockDim: leadingBlockDim(.K),
+      memPrec: memK,
+      transposed: transposed(.K),
+      tgOffset: slotA,
+      eventSlot: 0
+    )
+
+    // Wait for K prefetch before next iteration reads from TG slot A
+    ir += generateAsyncCopyWait(prefix: "wk_", eventSlot: 0)
 
     // MARK: - Loop Latch
 
-    // Terminate acc_after_head block before loop_latch
     ir += "  br label %loop_latch\n"
     ir += """
 
     loop_latch:
-      %m_updated = phi float [%corr_m_upd, %\(isCachedO ? "acc_after_head" : "acc_after_head")]
-      %l_updated = phi float [%rsum_l_new, %\(isCachedO ? "acc_after_head" : "acc_after_head")]
+      %m_updated = phi float [%corr_m_upd, %wk_after_wait]
+      %l_updated = phi float [%rsum_l_new, %wk_after_wait]
 
     """
 
     for i in 0..<oCachedCount {
-      ir += "  %o_acc_\(i) = phi \(irVecType(regO)) [%acc_o_final_\(i), %\(isCachedO ? "acc_after_head" : "acc_after_head")]\n"
+      ir += "  %o_acc_\(i) = phi \(irVecType(regO)) [%acc_o_final_\(i), %wk_after_wait]\n"
     }
 
     ir += """
 
-      %c_next = add i32 %c, \(blockT)
       br label %loop_header
 
     """

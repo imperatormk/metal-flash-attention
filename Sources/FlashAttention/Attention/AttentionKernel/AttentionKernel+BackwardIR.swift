@@ -538,7 +538,7 @@ extension AttentionKernel {
       ir += "  %dk_acc_\(i) = phi \(irVecType(regdK)) [%bkv_dk_dk_final_\(i), %bkv_dk_after_head]\n"
     }
     for i in 0..<dvCount {
-      ir += "  %dv_acc_\(i) = phi \(irVecType(regdV)) [%bkv_dv_dv_final_\(i), %bkv_dv_after_head]\n"
+      ir += "  %dv_acc_\(i) = phi \(irVecType(regdV)) [%bkv_dv_dv_final_\(i), %bkv_dk_after_head]\n"
     }
 
     ir += """

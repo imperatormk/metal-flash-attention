@@ -11,7 +11,7 @@ final class RectangularAttentionTest: XCTestCase {
       randomVecFloat = randomVecFloat * randomVecFloat * randomVecFloat
       var randomInts = SIMD2<Int>(randomVecFloat * SIMD2(128, 128))
       randomInts.replace(with: .one, where: randomInts .== .zero)
-      
+
       var matrixDimensions = (
         row: UInt32(randomInts[0]),
         column: UInt32.zero,
@@ -21,7 +21,7 @@ final class RectangularAttentionTest: XCTestCase {
       } else {
         matrixDimensions.column = UInt32.random(in: 10...128)
       }
-      
+
       var descriptor = AttentionDescriptor()
       descriptor.lowPrecisionInputs = Bool.random()
       descriptor.lowPrecisionIntermediates = Bool.random()
@@ -351,7 +351,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
   // correctness failures. Start by making the O matrix agree on both CPU
   // and GPU. Then, get the remaining operands to match.
 #if false
-  
+
   // Displays a matrix with dimensions N * 1.
   func printVector(_ matrix: [Float]) {
     let sequenceDimension = matrix.count / 1
@@ -446,7 +446,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
 #endif
   
   var errorCount: Int = .zero
-  func check(expected: [Float], actual: [Float], tolerance: Float) {
+  func check(expected: [Float], actual: [Float], tolerance: Float, label: String = "") {
     guard expected.count == actual.count else {
       fatalError("Arrays had different length.")
     }
@@ -463,7 +463,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
         // Update the error count in the outer scope.
         if errorCount < 10 {
           errorCount += 1
-          print("error: \(error) / ~1.000")
+          print("error[\(label)]: \(error) / ~1.000")
           print("- expected[\(i)] = \(expected[i])")
           print("-   actual[\(i)] = \(actual[i])")
           print("- test configuration: \(descriptor)")
@@ -488,11 +488,11 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
       check(expected: dQ, actual: resultDerivativeQ, tolerance: 5e-2)
     }
   } else {
-    check(expected: O, actual: resultO, tolerance: 2e-5)
-    check(expected: L, actual: resultL, tolerance: 2e-5)
-    check(expected: D, actual: resultD, tolerance: 2e-5)
-    check(expected: dV, actual: resultDerivativeV, tolerance: 2e-5)
-    check(expected: dK, actual: resultDerivativeK, tolerance: 2e-5)
-    check(expected: dQ, actual: resultDerivativeQ, tolerance: 2e-5)
+    check(expected: O, actual: resultO, tolerance: 2e-5, label: "O")
+    check(expected: L, actual: resultL, tolerance: 2e-5, label: "L")
+    check(expected: D, actual: resultD, tolerance: 2e-5, label: "D")
+    check(expected: dV, actual: resultDerivativeV, tolerance: 2e-5, label: "dV")
+    check(expected: dK, actual: resultDerivativeK, tolerance: 2e-5, label: "dK")
+    check(expected: dQ, actual: resultDerivativeQ, tolerance: 2e-5, label: "dQ")
   }
 }

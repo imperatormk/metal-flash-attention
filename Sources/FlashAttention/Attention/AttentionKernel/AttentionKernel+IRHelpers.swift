@@ -11,6 +11,130 @@ extension AttentionKernel {
 
   // MARK: - Async Copy Device → TG (2D)
 
+  /// Generate an inline async copy START (no wait). Gated to sidx == 0.
+  /// Returns IR that ends after the copy is initiated but NOT waited on.
+  /// Use generateAsyncCopyWait to wait + barrier later.
+  func generateAsyncCopyStart(
+    prefix p: String,
+    buffer: String,
+    operand: AttentionOperand,
+    dOuter: String,
+    seqOffset: String,
+    seqDim: UInt32,
+    blockSeq: UInt16,
+    blockHead: UInt16,
+    D: UInt32,
+    leadingDim: UInt32,
+    leadingBlockDim: UInt32,
+    memPrec: GEMMOperandPrecision,
+    transposed: Bool,
+    tgOffset: String = "0",
+    eventSlot: Int = 0
+  ) -> String {
+    let elemSize = UInt32(memPrec.size)
+    var ir = ""
+
+    ir += "  ; Async copy START \(operand) device→TG (\(p))\n"
+    ir += "  br i1 %is_sidx0, label %\(p)do_copy, label %\(p)skip_copy\n\n"
+    ir += "\(p)do_copy:\n"
+
+    // Source offset calculation
+    if transposed {
+      ir += "  %\(p)src_row = mul i32 \(dOuter), \(leadingDim)\n"
+      ir += "  %\(p)src_off32 = add i32 %\(p)src_row, \(seqOffset)\n"
+    } else {
+      ir += "  %\(p)src_row = mul i32 \(seqOffset), \(leadingDim)\n"
+      ir += "  %\(p)src_off32 = add i32 %\(p)src_row, \(dOuter)\n"
+    }
+    ir += "  %\(p)src_off = zext i32 %\(p)src_off32 to i64\n"
+    ir += "  %\(p)src_byte = mul i64 %\(p)src_off, \(elemSize)\n"
+    ir += "  %\(p)src_p = getelementptr i8, i8 addrspace(1)* \(buffer), i64 %\(p)src_byte\n"
+
+    ir += "  %\(p)d_rem_32 = sub i32 \(D), \(dOuter)\n"
+    ir += "  %\(p)d_cmp = icmp ult i32 %\(p)d_rem_32, \(blockHead)\n"
+    ir += "  %\(p)d_src = select i1 %\(p)d_cmp, i32 %\(p)d_rem_32, i32 \(blockHead)\n"
+    // Guard: if seqOffset >= seqDim, zero-height copy (no-op).
+    ir += "  %\(p)seq_oob = icmp uge i32 \(seqOffset), \(seqDim)\n"
+    ir += "  %\(p)seq_rem_raw = sub i32 \(seqDim), \(seqOffset)\n"
+    ir += "  %\(p)seq_rem_32 = select i1 %\(p)seq_oob, i32 0, i32 %\(p)seq_rem_raw\n"
+    ir += "  %\(p)seq_cmp = icmp ult i32 %\(p)seq_rem_32, \(blockSeq)\n"
+    ir += "  %\(p)seq_src = select i1 %\(p)seq_cmp, i32 %\(p)seq_rem_32, i32 \(blockSeq)\n"
+
+    let dstStride = leadingBlockDim * elemSize
+    let srcStride = leadingDim * elemSize
+
+    let (srcW, srcH, dstW, dstH): (String, String, UInt32, UInt32)
+    if transposed {
+      srcW = "%\(p)seq_src_bytes"
+      srcH = "%\(p)d_src_ext"
+      ir += "  %\(p)seq_src_bytes32 = mul i32 %\(p)seq_src, \(elemSize)\n"
+      ir += "  %\(p)seq_src_bytes = zext i32 %\(p)seq_src_bytes32 to i64\n"
+      ir += "  %\(p)d_src_ext = zext i32 %\(p)d_src to i64\n"
+      dstW = UInt32(blockSeq) * elemSize
+      dstH = UInt32(blockHead)
+    } else {
+      srcW = "%\(p)d_src_bytes"
+      srcH = "%\(p)seq_src_ext"
+      ir += "  %\(p)d_src_bytes32 = mul i32 %\(p)d_src, \(elemSize)\n"
+      ir += "  %\(p)d_src_bytes = zext i32 %\(p)d_src_bytes32 to i64\n"
+      ir += "  %\(p)seq_src_ext = zext i32 %\(p)seq_src to i64\n"
+      dstW = UInt32(blockHead) * elemSize
+      dstH = UInt32(blockSeq)
+    }
+
+    // TG destination pointer
+    ir += "  %\(p)dst_p = getelementptr i8, i8 addrspace(3)* %tg_base, i64 \(tgOffset)\n"
+
+    // Tile vectors
+    ir += "  %\(p)stile_w = insertelement <2 x i64> zeroinitializer, i64 \(srcW), i32 0\n"
+    ir += "  %\(p)stile = insertelement <2 x i64> %\(p)stile_w, i64 \(srcH), i32 1\n"
+    ir += "  %\(p)dtile_w = insertelement <2 x i64> zeroinitializer, i64 \(dstW), i32 0\n"
+    ir += "  %\(p)dtile = insertelement <2 x i64> %\(p)dtile_w, i64 \(dstH), i32 1\n"
+
+    // Event pointer (use specified slot)
+    ir += "  %\(p)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 \(eventSlot)\n"
+
+    // Async copy call — NO wait
+    ir += """
+      %\(p)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p3i8.p1i8(
+        i64 1, i64 1,
+        i8 addrspace(3)* %\(p)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(p)dtile,
+        i8 addrspace(1)* %\(p)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(p)stile,
+        <2 x i64> zeroinitializer, i32 0
+      )
+      store %event_t addrspace(3)* %\(p)ev, %event_t addrspace(3)** %\(p)evp
+
+    """
+
+    ir += "  br label %\(p)after_copy\n\n"
+    ir += "\(p)skip_copy:\n"
+    ir += "  br label %\(p)after_copy\n\n"
+    ir += "\(p)after_copy:\n"
+    // Barrier so all threads sync after sidx0 initiated the copy
+    ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+
+    return ir
+  }
+
+  /// Wait for a previously started async copy + barrier for TG visibility.
+  func generateAsyncCopyWait(
+    prefix p: String,
+    eventSlot: Int = 0
+  ) -> String {
+    var ir = ""
+    ir += "  ; Wait for async copy (\(p))\n"
+    ir += "  br i1 %is_sidx0, label %\(p)do_wait, label %\(p)skip_wait\n\n"
+    ir += "\(p)do_wait:\n"
+    ir += "  %\(p)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 \(eventSlot)\n"
+    ir += "  call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(p)evp)\n"
+    ir += "  br label %\(p)after_wait\n\n"
+    ir += "\(p)skip_wait:\n"
+    ir += "  br label %\(p)after_wait\n\n"
+    ir += "\(p)after_wait:\n"
+    ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+    return ir
+  }
+
   /// Generate an inline async copy from device to threadgroup.
   /// Gated to sidx == 0. Returns IR that ends after barrier.
   func generateAsyncCopyDeviceToTG(
@@ -140,6 +264,7 @@ extension AttentionKernel {
     // Address: tg_base + tgOffset + (row * leadingBlockDim + col) * elemSize
     // For non-transposed: row = seqOffset, col = headOffset (standard matrix layout)
     // The caller sets rowOffset/colOffset appropriately for the transpose state.
+    let tgOffsetI64 = (tgOffset == "0") ? nil : tgOffset
     if transposed {
       // Element address: each thread reads 2 elements (via morton_x offsets)
       // For transposed, row=morton_x+d, col=oig_y or similar
@@ -149,7 +274,12 @@ extension AttentionKernel {
         ir += "  %\(p)addr2_\(elem) = add i32 %\(p)addr_\(elem), \(colOffset)\n"
         ir += "  %\(p)byte_\(elem) = mul i32 %\(p)addr2_\(elem), \(elemSize)\n"
         ir += "  %\(p)byte64_\(elem) = zext i32 %\(p)byte_\(elem) to i64\n"
-        ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64_\(elem)\n"
+        if let off = tgOffsetI64 {
+          ir += "  %\(p)byte64o_\(elem) = add i64 %\(p)byte64_\(elem), \(off)\n"
+          ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64o_\(elem)\n"
+        } else {
+          ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64_\(elem)\n"
+        }
         ir += "  %\(p)typed_\(elem) = bitcast i8 addrspace(3)* %\(p)ptr_\(elem) to \(memType) addrspace(3)*\n"
         ir += "  %\(p)load_\(elem) = load \(memType), \(memType) addrspace(3)* %\(p)typed_\(elem)\n"
       }
@@ -169,7 +299,12 @@ extension AttentionKernel {
       ir += "  %\(p)addr2 = add i32 %\(p)addr, \(colOffset)\n"
       ir += "  %\(p)byte = mul i32 %\(p)addr2, \(elemSize)\n"
       ir += "  %\(p)byte64 = zext i32 %\(p)byte to i64\n"
-      ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64\n"
+      if let off = tgOffsetI64 {
+        ir += "  %\(p)byte64o = add i64 %\(p)byte64, \(off)\n"
+        ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64o\n"
+      } else {
+        ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte64\n"
+      }
       ir += "  %\(p)typed = bitcast i8 addrspace(3)* %\(p)ptr to <2 x \(memType)> addrspace(3)*\n"
       ir += "  %\(p)load = load <2 x \(memType)>, <2 x \(memType)> addrspace(3)* %\(p)typed, align \(elemSize * 2)\n"
 
@@ -291,7 +426,9 @@ extension AttentionKernel {
     leadingBlockDimA: UInt32, leadingBlockDimB: UInt32,
     cachedA: Bool,
     transposedA: Bool, transposedB: Bool,
-    cachePrefix: String = "cq_"  // prefix for cached A registers (e.g., "cq_", "ck_", "cv_", "cdo_")
+    cachePrefix: String = "cq_",  // prefix for cached A registers (e.g., "cq_", "ck_", "cv_", "cdo_")
+    tgOffset: String = "0",             // byte offset into TG for B (K) slot
+    skipFirstIterCopy: Bool = false     // if true, skip first d_outer iteration's async copy (TG already loaded)
   ) -> String {
     var ir = ""
     ir += "  ; === Outer Product \(A) * \(B)^T → \(C_name) ===\n"
@@ -321,22 +458,25 @@ extension AttentionKernel {
         // for each d { load Q from device, load K from TG, matmul }.
         // This avoids the extra async copy + barrier for Q entirely.
 
-        // Async copy B (K) to TG
-        ir += generateAsyncCopyDeviceToTG(
-          prefix: "\(ip)b_",
-          buffer: "%\(B)",
-          operand: B,
-          dOuter: dOuterStr,
-          seqOffset: traversalOffset,
-          seqDim: traversalDim,
-          blockSeq: blockT,
-          blockHead: UInt16(regSize),
-          D: D,
-          leadingDim: leadingDimB,
-          leadingBlockDim: leadingBlockDimB,
-          memPrec: memB,
-          transposed: transposedB
-        )
+        // Async copy B (K) to TG (skip first iter if already loaded externally)
+        if !(skipFirstIterCopy && iterIdx == 0) {
+          ir += generateAsyncCopyDeviceToTG(
+            prefix: "\(ip)b_",
+            buffer: "%\(B)",
+            operand: B,
+            dOuter: dOuterStr,
+            seqOffset: traversalOffset,
+            seqDim: traversalDim,
+            blockSeq: blockT,
+            blockHead: UInt16(regSize),
+            D: D,
+            leadingDim: leadingDimB,
+            leadingBlockDim: leadingBlockDimB,
+            memPrec: memB,
+            transposed: transposedB,
+            tgOffset: tgOffset
+          )
+        }
 
         // Head masking for A (Q) when not cached — same NaN prevention
         // as cached Q, but applied per d-step in the uncached path.
@@ -389,11 +529,11 @@ extension AttentionKernel {
               )
             }
 
-            // Head masking: zero when morton_x * 2 + headOffset >= D
+            // Head masking: zero when morton_x + headOffset >= D
+            // morton_x ∈ {0,2,4,6} already gives the head column position
             if aNeedsMask {
-              ir += "  %\(aPrefix)hpos = shl i32 %morton_x, 1\n"
-              ir += "  %\(aPrefix)hpos2 = add i32 %\(aPrefix)hpos, \(headOffsetA)\n"
-              ir += "  %\(aPrefix)oob = icmp uge i32 %\(aPrefix)hpos2, \(D)\n"
+              ir += "  %\(aPrefix)hpos = add i32 %morton_x, \(headOffsetA)\n"
+              ir += "  %\(aPrefix)oob = icmp uge i32 %\(aPrefix)hpos, \(D)\n"
               ir += "  %\(aPrefix)sram = select i1 %\(aPrefix)oob, \(irVecType(regA)) zeroinitializer, \(irVecType(regA)) %\(aLoadPrefix)sram\n"
             }
           }
@@ -422,7 +562,7 @@ extension AttentionKernel {
               }
               ir += generateTGLoad(
                 prefix: loadPrefix,
-                tgOffset: "0",
+                tgOffset: tgOffset,
                 rowOffset: "%\(loadPrefix)row",
                 colOffset: "%\(loadPrefix)col",
                 leadingBlockDim: leadingBlockDimB,
@@ -452,21 +592,24 @@ extension AttentionKernel {
 
       } else {
         // A is cached: only B needs TG. Copy B → load B → use cached A → matmul.
-        ir += generateAsyncCopyDeviceToTG(
-          prefix: "\(ip)b_",
-          buffer: "%\(B)",
-          operand: B,
-          dOuter: dOuterStr,
-          seqOffset: traversalOffset,
-          seqDim: traversalDim,
-          blockSeq: blockT,
-          blockHead: UInt16(regSize),
-          D: D,
-          leadingDim: leadingDimB,
-          leadingBlockDim: leadingBlockDimB,
-          memPrec: memB,
-          transposed: transposedB
-        )
+        if !(skipFirstIterCopy && iterIdx == 0) {
+          ir += generateAsyncCopyDeviceToTG(
+            prefix: "\(ip)b_",
+            buffer: "%\(B)",
+            operand: B,
+            dOuter: dOuterStr,
+            seqOffset: traversalOffset,
+            seqDim: traversalDim,
+            blockSeq: blockT,
+            blockHead: UInt16(regSize),
+            D: D,
+            leadingDim: leadingDimB,
+            leadingBlockDim: leadingBlockDimB,
+            memPrec: memB,
+            transposed: transposedB,
+            tgOffset: tgOffset
+          )
+        }
 
         for k in 0..<kSteps {
           let kOff = k * 8
@@ -496,7 +639,7 @@ extension AttentionKernel {
               }
               ir += generateTGLoad(
                 prefix: loadPrefix,
-                tgOffset: "0",
+                tgOffset: tgOffset,
                 rowOffset: "%\(loadPrefix)row",
                 colOffset: "%\(loadPrefix)col",
                 leadingBlockDim: leadingBlockDimB,
@@ -590,7 +733,14 @@ extension AttentionKernel {
     ir += "\(p)do_mask:\n"
     // mask_value = (0.875 / logBase2E) * -FLT_MAX
     let maskValue: Float = (0.875 / logBase2E) * -Float.greatestFiniteMagnitude
-    ir += "  %\(p)mask_val = bitcast i32 \(maskValue.bitPattern) to float\n"
+    ir += "  %\(p)mask_val_f32 = bitcast i32 \(maskValue.bitPattern) to float\n"
+    let maskValName: String
+    if regS == .FP32 {
+      maskValName = "%\(p)mask_val_f32"
+    } else {
+      maskValName = "%\(p)mask_val_cvt"
+      ir += "  \(maskValName) = fptrunc float %\(p)mask_val_f32 to \(irTypeName(regS))\n"
+    }
 
     // Compute which elements to mask
     // remainder_rt = traversalDim - traversalOffset (runtime remainder)
@@ -627,7 +777,7 @@ extension AttentionKernel {
       ir += "  %\(p)m1_\(i) = or i1 %\(p)bs_\(i), %\(p)e1_mask_\(i)\n"
 
       // Select masked values
-      let maskCast = (regS == .FP32) ? "%\(p)mask_val" : "TODO"
+      let maskCast = maskValName
       ir += "  %\(p)me0_\(i) = select i1 %\(p)m0_\(i), \(t) \(maskCast), \(t) %\(p)e0_\(i)\n"
       ir += "  %\(p)me1_\(i) = select i1 %\(p)m1_\(i), \(t) \(maskCast), \(t) %\(p)e1_\(i)\n"
 
@@ -683,7 +833,11 @@ extension AttentionKernel {
 
     // SIMD reduction: shuffle_xor with masks 1 and 8
     // m_new = max across thread elements
-    ir += "  %\(p)mf = bitcast \(t) \(lastM) to float\n"  // may already be float
+    if t == "float" {
+      ir += "  %\(p)mf = bitcast float \(lastM) to float\n"
+    } else {
+      ir += "  %\(p)mf = fpext \(t) \(lastM) to float\n"
+    }
     ir += irShuffleXorCall(result: "%\(p)shuf1", value: "%\(p)mf", mask: 1) + "\n"
     ir += "  %\(p)cmp_s1 = fcmp fast ogt float %\(p)mf, %\(p)shuf1\n"
     ir += "  %\(p)max_s1 = select i1 %\(p)cmp_s1, float %\(p)mf, float %\(p)shuf1\n"
@@ -841,10 +995,15 @@ extension AttentionKernel {
     cachedC: Bool,
     isFinalScale: Bool,
     scaleCorrection: String,  // SSA name of correction factor (or "" if none)
-    aSourcePrefix: String = "sp_p"  // SSA prefix for A registers (e.g., "sp_p" → %sp_p_0)
+    aSourcePrefix: String = "sp_p",       // SSA prefix for A registers (e.g., "sp_p" → %sp_p_0)
+    tgOffset: String = "0",              // byte offset into TG for V slot
+    skipFirstIterCopy: Bool = false      // if true, skip first d_outer iteration's async copy
   ) -> String {
     var ir = ""
     ir += "  ; === Accumulate \(C_name) += P * V ===\n"
+
+    // Note: head masking in the accumulate uses %morton_x directly.
+    // morton_x ∈ {0,2,4,6} already gives the head column position.
 
     // Scale existing accumulators by correction
     if !scaleCorrection.isEmpty {
@@ -871,27 +1030,31 @@ extension AttentionKernel {
     func emitHeadIteration(dOuterVal: UInt32, regSize: UInt32, iterIdx: Int) {
       let ip = "\(p)h\(iterIdx)_"
 
-      // Async copy V to TG
-      ir += generateAsyncCopyDeviceToTG(
-        prefix: "\(ip)v_",
-        buffer: "%\(B)",
-        operand: B,
-        dOuter: "\(dOuterVal)",
-        seqOffset: traversalOffset,
-        seqDim: traversalDim,
-        blockSeq: blockT,
-        blockHead: UInt16(regSize),
-        D: D,
-        leadingDim: leadingDimB,
-        leadingBlockDim: leadingBlockDimB,
-        memPrec: memB,
-        transposed: transposedB
-      )
+      // Async copy V to TG (skip first iter if already loaded externally)
+      if !(skipFirstIterCopy && iterIdx == 0) {
+        ir += generateAsyncCopyDeviceToTG(
+          prefix: "\(ip)v_",
+          buffer: "%\(B)",
+          operand: B,
+          dOuter: "\(dOuterVal)",
+          seqOffset: traversalOffset,
+          seqDim: traversalDim,
+          blockSeq: blockT,
+          blockHead: UInt16(regSize),
+          D: D,
+          leadingDim: leadingDimB,
+          leadingBlockDim: leadingBlockDimB,
+          memPrec: memB,
+          transposed: transposedB,
+          tgOffset: tgOffset
+        )
+      }
 
       // Inner multiply: for each k step in traversal
       let kSteps = Int(blockT / 8)
 
       // Multiply P * V for each head block and traversal step
+      let needsHeadMaskB = D < paddedD
       let dSteps = Int(regSize / 8)
       for k in 0..<kSteps {
         let kOff = k * 8
@@ -903,34 +1066,44 @@ extension AttentionKernel {
           // our IR uses oCachedCount SSA accumulators for all head positions.
           let accIdx = Int(dOuterVal) / 8 + d
 
+          let absHeadOff = Int(dOuterVal) + dOff
+          let bNeedsMask = needsHeadMaskB && absHeadOff + 8 > Int(D)
+
           // Load V tile from TG for this (k, d) pair.
           // V = B operand: B[k,j] = V[k,j] where k=traversal, j=head.
           let vPrefix = "\(ip)v_k\(k)_d\(d)_"
-          if transposedB {
-            // V stored as V^T[d, seq] in TG, ldBlockDim=blockT.
-            // V_TG[row=d, col=seq]. B[k,j] = V[k,j] = V^T[j,k] = V_TG[j, k].
-            // Transposed load → scalar (row, col) and (row+1, col):
-            //   row = j (head) = morton_x + dOff, col = k (traversal) = morton_y + kOff
-            ir += "  %\(vPrefix)row = add i32 %morton_x, \(dOff)\n"
-            ir += "  %\(vPrefix)col = add i32 %morton_y, \(kOff)\n"
+
+          if needsHeadMaskB && absHeadOff >= Int(D) {
+            // Entire B register is beyond D — zero it
+            ir += "  %\(vPrefix)sram = bitcast \(irVecType(regB)) zeroinitializer to \(irVecType(regB))\n"
           } else {
-            // V stored as V[seq, d] in TG, ldBlockDim=blockH.
-            // V_TG[row=seq, col=d]. B[k,j] = V[k,j] = V_TG[k, j].
-            // Non-transposed load → vector (row, col) and (row, col+1):
-            //   row = k (traversal) = morton_y + kOff, col = j (head) = morton_x + dOff
-            ir += "  %\(vPrefix)row = add i32 %morton_y, \(kOff)\n"
-            ir += "  %\(vPrefix)col = add i32 %morton_x, \(dOff)\n"
+            let loadPrefix = bNeedsMask ? "\(vPrefix)raw_" : vPrefix
+            if transposedB {
+              ir += "  %\(loadPrefix)row = add i32 %morton_x, \(dOff)\n"
+              ir += "  %\(loadPrefix)col = add i32 %morton_y, \(kOff)\n"
+            } else {
+              ir += "  %\(loadPrefix)row = add i32 %morton_y, \(kOff)\n"
+              ir += "  %\(loadPrefix)col = add i32 %morton_x, \(dOff)\n"
+            }
+            ir += generateTGLoad(
+              prefix: loadPrefix,
+              tgOffset: tgOffset,
+              rowOffset: "%\(loadPrefix)row",
+              colOffset: "%\(loadPrefix)col",
+              leadingBlockDim: leadingBlockDimB,
+              memPrec: memB,
+              regPrec: regB,
+              transposed: transposedB
+            )
+
+            // Head masking: zero the register if this thread's head position >= D
+            if bNeedsMask {
+              // morton_x * 2 gives the thread's head position within the 8-wide block
+              ir += "  %\(vPrefix)hpos = add i32 %morton_x, \(absHeadOff)\n"
+              ir += "  %\(vPrefix)oob = icmp uge i32 %\(vPrefix)hpos, \(D)\n"
+              ir += "  %\(vPrefix)sram = select i1 %\(vPrefix)oob, \(irVecType(regB)) zeroinitializer, \(irVecType(regB)) %\(loadPrefix)sram\n"
+            }
           }
-          ir += generateTGLoad(
-            prefix: vPrefix,
-            tgOffset: "0",
-            rowOffset: "%\(vPrefix)row",
-            colOffset: "%\(vPrefix)col",
-            leadingBlockDim: leadingBlockDimB,
-            memPrec: memB,
-            regPrec: regB,
-            transposed: transposedB
-          )
 
           // Load P tile: P_sram[k] (traversal step k)
           let pName = "%\(aSourcePrefix)_\(kOff / 8)"
@@ -1016,12 +1189,8 @@ extension AttentionKernel {
     // In both cases, headOffset = morton_x * 2 + dOuter + kOff (morton_x
     // contributes ×2 because each thread holds 2 adjacent elements).
 
-    // Pre-compute head mask: morton_x * 2 (the thread's column pair start)
-    // We only need this if D < paddedD (there are head positions to mask)
+    // Head masking: morton_x ∈ {0,2,4,6} directly gives the head column position.
     let needsHeadMask = D < paddedD
-    if needsHeadMask {
-      ir += "  %\(p)mx2 = shl i32 %morton_x, 1\n"
-    }
 
     var dOuter: UInt32 = 0
     var iterIdx = 0
@@ -1072,10 +1241,10 @@ extension AttentionKernel {
         }
 
         // Head masking: zero the register if this thread's head position >= D.
-        // headPos = morton_x * 2 + headStart. If headPos >= D, use zero.
+        // headPos = morton_x + headStart. morton_x ∈ {0,2,4,6}.
         if needsHeadMask && headStart + 8 > D {
           // Some threads in this k-step may be out of bounds
-          ir += "  %\(lp)hpos = add i32 %\(p)mx2, \(headStart)\n"
+          ir += "  %\(lp)hpos = add i32 %morton_x, \(headStart)\n"
           ir += "  %\(lp)oob = icmp uge i32 %\(lp)hpos, \(D)\n"
           ir += "  %\(p)sram_\(regIdx) = select i1 %\(lp)oob, \(irVecType(regPrec)) zeroinitializer, \(irVecType(regPrec)) %\(lp)sram\n"
         } else {
@@ -1167,27 +1336,60 @@ extension AttentionKernel {
           storeType = tO
         }
 
-        // TG address: (oig_y * leadingBlockDimO + morton_x + kOff) * elemSize
-        if transposedO {
-          ir += "  %\(sp)tg_row = add i32 %morton_x, \(kOff)\n"
-          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDimO)\n"
-          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %oig_y\n"
-        } else {
-          ir += "  %\(sp)tg_row = add i32 %oig_y, 0\n"
-          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDimO)\n"
-          ir += "  %\(sp)tg_col = add i32 %morton_x, \(kOff)\n"
-          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %\(sp)tg_col\n"
-        }
-        ir += "  %\(sp)tg_byte = mul i32 %\(sp)tg_addr2, \(elemSizeO)\n"
-        ir += "  %\(sp)tg_byte64 = zext i32 %\(sp)tg_byte to i64\n"
-        ir += "  %\(sp)tg_ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte64\n"
-        ir += "  %\(sp)tg_typed = bitcast i8 addrspace(3)* %\(sp)tg_ptr to <2 x \(storeType)> addrspace(3)*\n"
-
         // Guard store: only if thread is in bounds
         ir += "  %\(sp)in_bounds = icmp ult i32 %unsafe_par_off, \(parallelDim)\n"
         ir += "  br i1 %\(sp)in_bounds, label %\(sp)do_store, label %\(sp)skip_store\n\n"
         ir += "\(sp)do_store:\n"
-        ir += "  store <2 x \(storeType)> \(storeVec), <2 x \(storeType)> addrspace(3)* %\(sp)tg_typed\n"
+
+        if transposedO {
+          // Transposed: elements 0,1 are at head positions morton_x+kOff and
+          // morton_x+kOff+1 for the same seq row (oig_y). These map to
+          // TG[head0, oig_y] and TG[head1, oig_y] which are non-contiguous.
+          // Must use two scalar stores.
+          let se0: String
+          let se1: String
+          if storeVec.hasSuffix("svec") {
+            se0 = "%\(sp)st0"
+            se1 = "%\(sp)st1"
+          } else {
+            // storeVec is %{sp}v2, extract elements
+            ir += "  %\(sp)se0 = extractelement <2 x \(storeType)> \(storeVec), i32 0\n"
+            ir += "  %\(sp)se1 = extractelement <2 x \(storeType)> \(storeVec), i32 1\n"
+            se0 = "%\(sp)se0"
+            se1 = "%\(sp)se1"
+          }
+          // Element 0 → TG[morton_x + kOff, oig_y]
+          ir += "  %\(sp)tg_row0 = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(sp)tg_addr0 = mul i32 %\(sp)tg_row0, \(leadingBlockDimO)\n"
+          ir += "  %\(sp)tg_addr0b = add i32 %\(sp)tg_addr0, %oig_y\n"
+          ir += "  %\(sp)tg_byte0 = mul i32 %\(sp)tg_addr0b, \(elemSizeO)\n"
+          ir += "  %\(sp)tg_byte0_64 = zext i32 %\(sp)tg_byte0 to i64\n"
+          ir += "  %\(sp)tg_ptr0 = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte0_64\n"
+          ir += "  %\(sp)tg_typed0 = bitcast i8 addrspace(3)* %\(sp)tg_ptr0 to \(storeType) addrspace(3)*\n"
+          ir += "  store \(storeType) \(se0), \(storeType) addrspace(3)* %\(sp)tg_typed0\n"
+          // Element 1 → TG[morton_x + kOff + 1, oig_y]
+          ir += "  %\(sp)tg_row1 = add i32 %morton_x, \(kOff + 1)\n"
+          ir += "  %\(sp)tg_addr1 = mul i32 %\(sp)tg_row1, \(leadingBlockDimO)\n"
+          ir += "  %\(sp)tg_addr1b = add i32 %\(sp)tg_addr1, %oig_y\n"
+          ir += "  %\(sp)tg_byte1 = mul i32 %\(sp)tg_addr1b, \(elemSizeO)\n"
+          ir += "  %\(sp)tg_byte1_64 = zext i32 %\(sp)tg_byte1 to i64\n"
+          ir += "  %\(sp)tg_ptr1 = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte1_64\n"
+          ir += "  %\(sp)tg_typed1 = bitcast i8 addrspace(3)* %\(sp)tg_ptr1 to \(storeType) addrspace(3)*\n"
+          ir += "  store \(storeType) \(se1), \(storeType) addrspace(3)* %\(sp)tg_typed1\n"
+        } else {
+          // Non-transposed: elements 0,1 are at head positions morton_x+kOff
+          // and morton_x+kOff+1, which are contiguous in memory. Use <2 x T> store.
+          ir += "  %\(sp)tg_row = add i32 %oig_y, 0\n"
+          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDimO)\n"
+          ir += "  %\(sp)tg_col = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %\(sp)tg_col\n"
+          ir += "  %\(sp)tg_byte = mul i32 %\(sp)tg_addr2, \(elemSizeO)\n"
+          ir += "  %\(sp)tg_byte64 = zext i32 %\(sp)tg_byte to i64\n"
+          ir += "  %\(sp)tg_ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte64\n"
+          ir += "  %\(sp)tg_typed = bitcast i8 addrspace(3)* %\(sp)tg_ptr to <2 x \(storeType)> addrspace(3)*\n"
+          ir += "  store <2 x \(storeType)> \(storeVec), <2 x \(storeType)> addrspace(3)* %\(sp)tg_typed\n"
+        }
+
         ir += "  br label %\(sp)skip_store\n\n"
         ir += "\(sp)skip_store:\n"
       }
@@ -1841,26 +2043,54 @@ extension AttentionKernel {
           storeType = tReg
         }
 
-        // TG address
+        ir += "  %\(sp)in_bounds = icmp ult i32 %unsafe_par_off, \(parallelDim)\n"
+        ir += "  br i1 %\(sp)in_bounds, label %\(sp)do_store, label %\(sp)skip_store\n\n"
+        ir += "\(sp)do_store:\n"
+
         if transposed {
-          ir += "  %\(sp)tg_row = add i32 %morton_x, \(kOff)\n"
-          ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDim)\n"
-          ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %oig_y\n"
+          // Transposed: elements 0,1 are at head positions morton_x+kOff and
+          // morton_x+kOff+1 for the same seq row (oig_y). In TG[head, seq],
+          // these map to non-contiguous addresses. Use two scalar stores.
+          let se0: String
+          let se1: String
+          if storeVec.hasSuffix("svec") {
+            se0 = "%\(sp)st0"
+            se1 = "%\(sp)st1"
+          } else {
+            ir += "  %\(sp)se0 = extractelement <2 x \(storeType)> \(storeVec), i32 0\n"
+            ir += "  %\(sp)se1 = extractelement <2 x \(storeType)> \(storeVec), i32 1\n"
+            se0 = "%\(sp)se0"
+            se1 = "%\(sp)se1"
+          }
+          ir += "  %\(sp)tg_row0 = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(sp)tg_addr0 = mul i32 %\(sp)tg_row0, \(leadingBlockDim)\n"
+          ir += "  %\(sp)tg_addr0b = add i32 %\(sp)tg_addr0, %oig_y\n"
+          ir += "  %\(sp)tg_byte0 = mul i32 %\(sp)tg_addr0b, \(elemSize)\n"
+          ir += "  %\(sp)tg_byte0_64 = zext i32 %\(sp)tg_byte0 to i64\n"
+          ir += "  %\(sp)tg_ptr0 = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte0_64\n"
+          ir += "  %\(sp)tg_typed0 = bitcast i8 addrspace(3)* %\(sp)tg_ptr0 to \(storeType) addrspace(3)*\n"
+          ir += "  store \(storeType) \(se0), \(storeType) addrspace(3)* %\(sp)tg_typed0\n"
+          ir += "  %\(sp)tg_row1 = add i32 %morton_x, \(kOff + 1)\n"
+          ir += "  %\(sp)tg_addr1 = mul i32 %\(sp)tg_row1, \(leadingBlockDim)\n"
+          ir += "  %\(sp)tg_addr1b = add i32 %\(sp)tg_addr1, %oig_y\n"
+          ir += "  %\(sp)tg_byte1 = mul i32 %\(sp)tg_addr1b, \(elemSize)\n"
+          ir += "  %\(sp)tg_byte1_64 = zext i32 %\(sp)tg_byte1 to i64\n"
+          ir += "  %\(sp)tg_ptr1 = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte1_64\n"
+          ir += "  %\(sp)tg_typed1 = bitcast i8 addrspace(3)* %\(sp)tg_ptr1 to \(storeType) addrspace(3)*\n"
+          ir += "  store \(storeType) \(se1), \(storeType) addrspace(3)* %\(sp)tg_typed1\n"
         } else {
+          // Non-transposed: elements are at contiguous head positions. Use <2 x T> store.
           ir += "  %\(sp)tg_row = add i32 %oig_y, 0\n"
           ir += "  %\(sp)tg_addr = mul i32 %\(sp)tg_row, \(leadingBlockDim)\n"
           ir += "  %\(sp)tg_col = add i32 %morton_x, \(kOff)\n"
           ir += "  %\(sp)tg_addr2 = add i32 %\(sp)tg_addr, %\(sp)tg_col\n"
+          ir += "  %\(sp)tg_byte = mul i32 %\(sp)tg_addr2, \(elemSize)\n"
+          ir += "  %\(sp)tg_byte64 = zext i32 %\(sp)tg_byte to i64\n"
+          ir += "  %\(sp)tg_ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte64\n"
+          ir += "  %\(sp)tg_typed = bitcast i8 addrspace(3)* %\(sp)tg_ptr to <2 x \(storeType)> addrspace(3)*\n"
+          ir += "  store <2 x \(storeType)> \(storeVec), <2 x \(storeType)> addrspace(3)* %\(sp)tg_typed\n"
         }
-        ir += "  %\(sp)tg_byte = mul i32 %\(sp)tg_addr2, \(elemSize)\n"
-        ir += "  %\(sp)tg_byte64 = zext i32 %\(sp)tg_byte to i64\n"
-        ir += "  %\(sp)tg_ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(sp)tg_byte64\n"
-        ir += "  %\(sp)tg_typed = bitcast i8 addrspace(3)* %\(sp)tg_ptr to <2 x \(storeType)> addrspace(3)*\n"
 
-        ir += "  %\(sp)in_bounds = icmp ult i32 %unsafe_par_off, \(parallelDim)\n"
-        ir += "  br i1 %\(sp)in_bounds, label %\(sp)do_store, label %\(sp)skip_store\n\n"
-        ir += "\(sp)do_store:\n"
-        ir += "  store <2 x \(storeType)> \(storeVec), <2 x \(storeType)> addrspace(3)* %\(sp)tg_typed\n"
         ir += "  br label %\(sp)skip_store\n\n"
         ir += "\(sp)skip_store:\n"
       }
