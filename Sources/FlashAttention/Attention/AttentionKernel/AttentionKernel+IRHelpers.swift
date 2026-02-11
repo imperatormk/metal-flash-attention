@@ -191,13 +191,88 @@ extension AttentionKernel {
     return ir
   }
 
+  // MARK: - Load from Device into Register (SIMD matrix)
+
+  /// Generate IR to load a <2 x T> directly from device memory (addrspace 1),
+  /// convert precision, and expand to <64 x T> via insertelement.
+  /// bufferName: SSA name of the device pointer (e.g., "%Q")
+  /// seqOffset: SSA name or literal for the sequence offset of this thread
+  /// headOffset: SSA name or literal for the head offset of this thread
+  /// leadingDim: the leading dimension of the buffer
+  func generateDeviceLoad(
+    prefix p: String,
+    bufferName: String,
+    seqOffset: String,         // row in non-transposed (e.g., "%par_group_off + oig_y")
+    headOffset: String,        // col in non-transposed (e.g., "d_outer + morton_x * 8")
+    leadingDim: UInt32,
+    memPrec: GEMMOperandPrecision,
+    regPrec: GEMMOperandPrecision,
+    transposed: Bool
+  ) -> String {
+    let elemSize = UInt32(memPrec.size)
+    let memType = irTypeName(memPrec)
+    let regType = irTypeName(regPrec)
+    var ir = ""
+
+    if transposed {
+      // Transposed: each thread reads 2 elements at (row+0, col) and (row+1, col)
+      for elem in 0..<2 {
+        ir += "  %\(p)r_\(elem) = add i32 \(headOffset), \(elem)\n"
+        ir += "  %\(p)addr_\(elem) = mul i32 %\(p)r_\(elem), \(leadingDim)\n"
+        ir += "  %\(p)addr2_\(elem) = add i32 %\(p)addr_\(elem), \(seqOffset)\n"
+        ir += "  %\(p)byte_\(elem) = mul i32 %\(p)addr2_\(elem), \(elemSize)\n"
+        ir += "  %\(p)byte64_\(elem) = zext i32 %\(p)byte_\(elem) to i64\n"
+        ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(1)* \(bufferName), i64 %\(p)byte64_\(elem)\n"
+        ir += "  %\(p)typed_\(elem) = bitcast i8 addrspace(1)* %\(p)ptr_\(elem) to \(memType) addrspace(1)*\n"
+        ir += "  %\(p)load_\(elem) = load \(memType), \(memType) addrspace(1)* %\(p)typed_\(elem)\n"
+      }
+      if memPrec != regPrec {
+        for elem in 0..<2 {
+          ir += "  %\(p)ext_\(elem) = fpext \(memType) %\(p)load_\(elem) to \(regType)\n"
+        }
+        ir += "  %\(p)v2_a = insertelement <2 x \(regType)> undef, \(regType) %\(p)ext_0, i32 0\n"
+        ir += "  %\(p)v2 = insertelement <2 x \(regType)> %\(p)v2_a, \(regType) %\(p)ext_1, i32 1\n"
+      } else {
+        ir += "  %\(p)v2_a = insertelement <2 x \(memType)> undef, \(memType) %\(p)load_0, i32 0\n"
+        ir += "  %\(p)v2 = insertelement <2 x \(memType)> %\(p)v2_a, \(memType) %\(p)load_1, i32 1\n"
+      }
+    } else {
+      // Non-transposed: load contiguous <2 x T> from row-major layout
+      ir += "  %\(p)addr = mul i32 \(seqOffset), \(leadingDim)\n"
+      ir += "  %\(p)addr2 = add i32 %\(p)addr, \(headOffset)\n"
+      ir += "  %\(p)byte = mul i32 %\(p)addr2, \(elemSize)\n"
+      ir += "  %\(p)byte64 = zext i32 %\(p)byte to i64\n"
+      ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(1)* \(bufferName), i64 %\(p)byte64\n"
+      ir += "  %\(p)typed = bitcast i8 addrspace(1)* %\(p)ptr to <2 x \(memType)> addrspace(1)*\n"
+      ir += "  %\(p)load = load <2 x \(memType)>, <2 x \(memType)> addrspace(1)* %\(p)typed, align \(elemSize * 2)\n"
+
+      if memPrec != regPrec {
+        ir += "  %\(p)e0 = extractelement <2 x \(memType)> %\(p)load, i32 0\n"
+        ir += "  %\(p)e1 = extractelement <2 x \(memType)> %\(p)load, i32 1\n"
+        ir += "  %\(p)ext0 = fpext \(memType) %\(p)e0 to \(regType)\n"
+        ir += "  %\(p)ext1 = fpext \(memType) %\(p)e1 to \(regType)\n"
+        ir += "  %\(p)v2_a = insertelement <2 x \(regType)> undef, \(regType) %\(p)ext0, i32 0\n"
+        ir += "  %\(p)v2 = insertelement <2 x \(regType)> %\(p)v2_a, \(regType) %\(p)ext1, i32 1\n"
+      } else {
+        ir += "  %\(p)v2 = bitcast <2 x \(memType)> %\(p)load to <2 x \(memType)>\n"
+      }
+    }
+
+    // Expand <2 x T> to <64 x T>
+    ir += irShuffleToVec64(result: "%\(p)sram", src: "%\(p)v2", type: regPrec) + "\n"
+
+    return ir
+  }
+
   // MARK: - Outer Product (S = A * B^T)
 
   /// Generate the outer product: for each d_outer block, async copy B to TG,
-  /// barrier, load A (from cache or TG), matmul S += A * B.
+  /// barrier, load A from device or cache, load B tiles from TG interleaved
+  /// with matmul.
   ///
-  /// This always uses TG for B (RHS). For A (LHS), it uses cached registers
-  /// if cachedA is true, or loads from TG after async copying.
+  /// For B (RHS): always uses TG via async copy.
+  /// For A (LHS): uses cached registers if cachedA, otherwise loads directly
+  /// from device memory (matching the reference's pattern).
   ///
   /// Result: S accumulators are in %{C_name}_final_0 .. %{C_name}_final_{count-1}
   func generateOuterProduct(
@@ -231,11 +306,12 @@ extension AttentionKernel {
       let kSteps = Int(regSize / 8)
 
       if !cachedA {
-        // When A (Q) is not cached, both A and B share TG at offset 0.
-        // We must load them sequentially: copy B → load B → barrier →
-        // copy A → load A → multiply-accumulate.
+        // A (Q) not cached: load Q directly from device, K via TG.
+        // Matches reference pattern: async_copy K→TG, barrier, then
+        // for each d { load Q from device, load K from TG, matmul }.
+        // This avoids the extra async copy + barrier for Q entirely.
 
-        // Phase 1: Async copy B (K) to TG, load all B tiles into registers
+        // Async copy B (K) to TG
         ir += generateAsyncCopyDeviceToTG(
           prefix: "\(ip)b_",
           buffer: "%\(B)",
@@ -252,9 +328,46 @@ extension AttentionKernel {
           transposed: transposedB
         )
 
-        // Pre-load all B tiles from TG into SSA registers
+        // Interleaved: for each d step, load Q from device, then
+        // for each traversal tile, load K from TG + matmul.
         for k in 0..<kSteps {
           let kOff = k * 8
+
+          // Load A (Q) directly from device memory for this d step
+          let aPrefix = "\(ip)a_k\(k)_"
+          // Q address: Q[seq, head] where seq = parallelization thread offset,
+          // head = d_outer + kOff + morton_x (each thread's 2 elements)
+          if transposedA {
+            // Q stored as Q^T[head, seq]: addr = (head) * leadingDimA + (seq)
+            ir += "  %\(aPrefix)seq = add i32 %oig_y, 0\n"
+            ir += "  %\(aPrefix)head = add i32 %morton_x, \(Int(dOuterVal) + kOff)\n"
+            ir += generateDeviceLoad(
+              prefix: aPrefix,
+              bufferName: "%\(A)",
+              seqOffset: "%\(aPrefix)seq",
+              headOffset: "%\(aPrefix)head",
+              leadingDim: leadingDimA,
+              memPrec: memA,
+              regPrec: regA,
+              transposed: true
+            )
+          } else {
+            // Q stored as Q[seq, head]: addr = (seq) * leadingDimA + (head)
+            ir += "  %\(aPrefix)seq = add i32 %oig_y, 0\n"
+            ir += "  %\(aPrefix)head = add i32 %morton_x, \(Int(dOuterVal) + kOff)\n"
+            ir += generateDeviceLoad(
+              prefix: aPrefix,
+              bufferName: "%\(A)",
+              seqOffset: "%\(aPrefix)seq",
+              headOffset: "%\(aPrefix)head",
+              leadingDim: leadingDimA,
+              memPrec: memA,
+              regPrec: regA,
+              transposed: false
+            )
+          }
+
+          // Load B (K) tiles from TG and multiply immediately
           for t in 0..<sSramCount {
             let tOff = t * 8
             let bPrefix = "\(ip)b_k\(k)_t\(t)_"
@@ -275,57 +388,7 @@ extension AttentionKernel {
               regPrec: regB,
               transposed: !transposedB
             )
-          }
-        }
 
-        // Barrier: B data consumed from TG, safe to reuse for A
-        ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
-
-        // Phase 2: Async copy A (Q) to TG, load all A tiles into registers
-        ir += generateAsyncCopyDeviceToTG(
-          prefix: "\(ip)a_",
-          buffer: "%\(A)",
-          operand: A,
-          dOuter: dOuterStr,
-          seqOffset: "%par_group_off",
-          seqDim: parallelDim,
-          blockSeq: blockP,
-          blockHead: UInt16(regSize),
-          D: D,
-          leadingDim: leadingDimA,
-          leadingBlockDim: leadingBlockDimA,
-          memPrec: memA,
-          transposed: transposedA
-        )
-
-        // Pre-load all A tiles from TG into SSA registers
-        for k in 0..<kSteps {
-          let kOff = k * 8
-          let aPrefix = "\(ip)a_k\(k)_"
-          if transposedA {
-            ir += "  %\(aPrefix)row = add i32 %morton_x, \(kOff)\n"
-            ir += "  %\(aPrefix)col = add i32 %oig_y, 0\n"
-          } else {
-            ir += "  %\(aPrefix)row = add i32 %oig_y, 0\n"
-            ir += "  %\(aPrefix)col = add i32 %morton_x, \(kOff)\n"
-          }
-          ir += generateTGLoad(
-            prefix: aPrefix,
-            tgOffset: "0",
-            rowOffset: "%\(aPrefix)row",
-            colOffset: "%\(aPrefix)col",
-            leadingBlockDim: leadingBlockDimA,
-            memPrec: memA,
-            regPrec: regA,
-            transposed: transposedA
-          )
-        }
-
-        // Phase 3: Multiply-accumulate using pre-loaded A and B registers
-        for k in 0..<kSteps {
-          let aPrefix = "\(ip)a_k\(k)_"
-          for t in 0..<sSramCount {
-            let bPrefix = "\(ip)b_k\(k)_t\(t)_"
             let cIn = (k == 0) ? cNames[t] : "%\(ip)c_k\(k-1)_t\(t)"
             let cOut = "%\(ip)c_k\(k)_t\(t)"
             ir += irMultiplyAccumulateCall(
@@ -875,36 +938,16 @@ extension AttentionKernel {
     transposed: Bool
   ) -> String {
     var ir = ""
-    ir += "  ; === Cache load \(operand) ===\n"
+    ir += "  ; === Cache load \(operand) directly from device ===\n"
 
-    // For each d_outer block:
-    //   1. Async copy device → TG
-    //   2. Barrier
-    //   3. Load from TG into registers
+    // Load directly from device memory into registers — no TG, no async copy,
+    // no barriers. Matches reference pattern (preferAsyncCache=false on M1).
     var dOuter: UInt32 = 0
     var iterIdx = 0
     while dOuter < paddedD {
       let regSize = min(UInt32(blockH), paddedD - dOuter)
       let ip = "\(p)d\(iterIdx)_"
 
-      // Async copy
-      ir += generateAsyncCopyDeviceToTG(
-        prefix: "\(ip)cp_",
-        buffer: "%\(operand)",
-        operand: operand,
-        dOuter: "\(dOuter)",
-        seqOffset: "%par_group_off",
-        seqDim: parallelDim,
-        blockSeq: blockP,
-        blockHead: UInt16(regSize),
-        D: D,
-        leadingDim: leadingDim,
-        leadingBlockDim: leadingBlockDim,
-        memPrec: memPrec,
-        transposed: transposed
-      )
-
-      // Load from TG into registers
       let kSteps = Int(regSize / 8)
       for k in 0..<kSteps {
         let kOff = k * 8
@@ -912,26 +955,34 @@ extension AttentionKernel {
         let lp = "\(ip)k\(k)_"
 
         if transposed {
-          ir += "  %\(lp)row = add i32 %morton_x, \(kOff)\n"
-          ir += "  %\(lp)col = add i32 %oig_y, 0\n"
+          ir += "  %\(lp)seq = add i32 %oig_y, 0\n"
+          ir += "  %\(lp)head = add i32 %morton_x, \(Int(dOuter) + kOff)\n"
+          ir += generateDeviceLoad(
+            prefix: lp,
+            bufferName: "%\(operand)",
+            seqOffset: "%\(lp)seq",
+            headOffset: "%\(lp)head",
+            leadingDim: leadingDim,
+            memPrec: memPrec,
+            regPrec: regPrec,
+            transposed: true
+          )
         } else {
-          ir += "  %\(lp)row = add i32 %oig_y, 0\n"
-          ir += "  %\(lp)col = add i32 %morton_x, \(kOff)\n"
+          ir += "  %\(lp)seq = add i32 %oig_y, 0\n"
+          ir += "  %\(lp)head = add i32 %morton_x, \(Int(dOuter) + kOff)\n"
+          ir += generateDeviceLoad(
+            prefix: lp,
+            bufferName: "%\(operand)",
+            seqOffset: "%\(lp)seq",
+            headOffset: "%\(lp)head",
+            leadingDim: leadingDim,
+            memPrec: memPrec,
+            regPrec: regPrec,
+            transposed: false
+          )
         }
-        ir += generateTGLoad(
-          prefix: lp,
-          tgOffset: "0",
-          rowOffset: "%\(lp)row",
-          colOffset: "%\(lp)col",
-          leadingBlockDim: leadingBlockDim,
-          memPrec: memPrec,
-          regPrec: regPrec,
-          transposed: transposed
-        )
         ir += "  %cq_sram_\(regIdx) = bitcast \(irVecType(regPrec)) %\(lp)sram to \(irVecType(regPrec))\n"
       }
-
-      ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
 
       dOuter += UInt32(blockH)
       iterIdx += 1
