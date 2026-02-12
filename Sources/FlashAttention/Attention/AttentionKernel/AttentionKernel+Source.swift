@@ -19,6 +19,9 @@ extension AttentionKernel {
     public var C: UInt32 = 0          // column sequence length
     /// Leading dimensions derived from transpose state + sequence lengths.
     public var leadingDimensions: [AttentionOperand: UInt32] = [:]
+    /// When true, R and C are loaded from batch_params buffer at runtime
+    /// instead of being baked as literals. Avoids recompilation when R/C change.
+    public var dynamicRC: Bool = false
 
     public init() {}
   }
@@ -41,15 +44,28 @@ extension AttentionKernel {
     // For the forward kernel:
     //   parallelization = R, traversal = C
     //   Q, O are parallelization operands; K, V are traversal operands
-    let parallelDim: UInt32
-    let traversalDim: UInt32
-    switch type {
-    case .forward, .backwardQuery:
-      parallelDim = R
-      traversalDim = C
-    case .backwardKeyValue:
-      parallelDim = C
-      traversalDim = R
+    let parallelDim: String
+    let traversalDim: String
+    if desc.dynamicRC {
+      // Dynamic mode: R/C loaded from batch_params at runtime (SSA regs)
+      switch type {
+      case .forward, .backwardQuery:
+        parallelDim = "%dyn_R"
+        traversalDim = "%dyn_C"
+      case .backwardKeyValue:
+        parallelDim = "%dyn_C"
+        traversalDim = "%dyn_R"
+      }
+    } else {
+      // Static mode: baked as literals
+      switch type {
+      case .forward, .backwardQuery:
+        parallelDim = "\(R)"
+        traversalDim = "\(C)"
+      case .backwardKeyValue:
+        parallelDim = "\(C)"
+        traversalDim = "\(R)"
+      }
     }
 
     // Padded head dimension (round up to 8)
@@ -175,7 +191,7 @@ extension AttentionKernel {
     // Kernel function signature: 11 device buffers + 1 TG buffer + gid + sidx + lane_id
     // Buffer 10 = batch_params: [numHeads, kvRepeatFactor, Q_stride, K_stride,
     //   V_stride, O_stride, L_stride, D_stride, dO_stride, dV_stride, dK_stride,
-    //   dQ_stride, causalOffset]
+    //   dQ_stride, causalOffset, R, C]
     ir += """
 
     define void @attention(
@@ -233,6 +249,14 @@ extension AttentionKernel {
     // Load causal offset from bp[12]
     ir += "  %causal_off_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 12\n"
     ir += "  %causal_offset = load i32, i32 addrspace(1)* %causal_off_ptr\n"
+
+    // Dynamic R/C: load from bp[13], bp[14]
+    if desc.dynamicRC {
+      ir += "  %dyn_R_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 13\n"
+      ir += "  %dyn_R = load i32, i32 addrspace(1)* %dyn_R_ptr\n"
+      ir += "  %dyn_C_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 14\n"
+      ir += "  %dyn_C = load i32, i32 addrspace(1)* %dyn_C_ptr\n"
+    }
     ir += "\n"
 
     // GEP each buffer to per-head pointer

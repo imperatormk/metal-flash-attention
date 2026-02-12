@@ -20,7 +20,7 @@ extension AttentionKernel {
     operand: AttentionOperand,
     dOuter: String,
     seqOffset: String,
-    seqDim: UInt32,
+    seqDim: String,
     blockSeq: UInt16,
     blockHead: UInt16,
     D: UInt32,
@@ -143,7 +143,7 @@ extension AttentionKernel {
     operand: AttentionOperand,
     dOuter: String,           // SSA name or literal for d_outer offset
     seqOffset: String,        // SSA name or literal for sequence offset
-    seqDim: UInt32,           // total sequence dimension
+    seqDim: String,           // total sequence dimension
     blockSeq: UInt16,         // block size along sequence dim
     blockHead: UInt16,        // block size along head dim (register size for this iteration)
     D: UInt32,                // total head dimension
@@ -417,7 +417,7 @@ extension AttentionKernel {
     blockP: UInt16, blockT: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32, traversalDim: UInt32,
+    parallelDim: String, traversalDim: String,
     traversalOffset: String,
     regA: GEMMOperandPrecision, regB: GEMMOperandPrecision,
     regC: GEMMOperandPrecision,
@@ -701,7 +701,7 @@ extension AttentionKernel {
   func generateMaskEdge(
     prefix p: String,
     sSramCount: Int,
-    blockT: UInt16, traversalDim: UInt32,
+    blockT: UInt16, traversalDim: String,
     traversalOffset: String,
     regS: GEMMOperandPrecision,
     scaleFactor: Float,
@@ -714,9 +714,14 @@ extension AttentionKernel {
 
     ir += "  ; === Mask attention matrix edge ===\n"
 
-    // remainder = traversalDim % blockT
-    let remainder = traversalDim % UInt32(blockT)
-    let needsEdgeMask = remainder != 0
+    // In static mode, skip mask code entirely if not needed.
+    // In dynamic mode (traversalDim is an SSA reg), always emit mask code.
+    let needsEdgeMask: Bool
+    if let staticDim = UInt32(traversalDim) {
+      needsEdgeMask = (staticDim % UInt32(blockT)) != 0
+    } else {
+      needsEdgeMask = true  // dynamic: always emit edge mask
+    }
 
     if !needsEdgeMask && !causal {
       ir += "  ; No masking needed\n"
@@ -1006,7 +1011,7 @@ extension AttentionKernel {
     blockP: UInt16, blockT: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32, traversalDim: UInt32,
+    parallelDim: String, traversalDim: String,
     traversalOffset: String,
     regA: GEMMOperandPrecision, regB: GEMMOperandPrecision,
     regC: GEMMOperandPrecision,
@@ -1189,7 +1194,7 @@ extension AttentionKernel {
   func generateCacheLoad(
     operand: AttentionOperand,
     prefix p: String,
-    parallelDim: UInt32,
+    parallelDim: String,
     D: UInt32,
     paddedD: UInt32,
     blockP: UInt16, blockH: UInt16,
@@ -1289,7 +1294,7 @@ extension AttentionKernel {
     blockP: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32,
+    parallelDim: String,
     regO: GEMMOperandPrecision, memO: GEMMOperandPrecision,
     memL: GEMMOperandPrecision,
     leadingDimO: UInt32, leadingBlockDimO: UInt32,
@@ -1580,7 +1585,7 @@ extension AttentionKernel {
     scaleFactor: Float,
     lBufferName: String,       // L buffer pointer (e.g., "%L_buf")
     traversalOffset: String,   // loop variable for traversal offset (e.g., "%bkv_r")
-    traversalDim: UInt32,      // total traversal dimension (R)
+    traversalDim: String,      // total traversal dimension (R)
     memL: GEMMOperandPrecision,
     sSource: String = "s_final"  // SSA prefix for S vectors
   ) -> String {
@@ -1606,7 +1611,8 @@ extension AttentionKernel {
         ir += "  %\(p)lidx_\(i)_\(elem) = add i32 %\(p)tbase_\(i), %\(p)mxe_\(i)_\(elem)\n"
         // Clamp to bounds
         ir += "  %\(p)lcmp_\(i)_\(elem) = icmp ult i32 %\(p)lidx_\(i)_\(elem), \(traversalDim)\n"
-        ir += "  %\(p)lsafe_\(i)_\(elem) = select i1 %\(p)lcmp_\(i)_\(elem), i32 %\(p)lidx_\(i)_\(elem), i32 \(traversalDim - 1)\n"
+        ir += "  %\(p)ldm1_\(i)_\(elem) = sub i32 \(traversalDim), 1\n"
+        ir += "  %\(p)lsafe_\(i)_\(elem) = select i1 %\(p)lcmp_\(i)_\(elem), i32 %\(p)lidx_\(i)_\(elem), i32 %\(p)ldm1_\(i)_\(elem)\n"
         ir += "  %\(p)loff_\(i)_\(elem) = zext i32 %\(p)lsafe_\(i)_\(elem) to i64\n"
         ir += "  %\(p)lbyte_\(i)_\(elem) = mul i64 %\(p)loff_\(i)_\(elem), \(elemSizeL)\n"
         ir += "  %\(p)lptr_\(i)_\(elem) = getelementptr i8, i8 addrspace(1)* \(lBufferName), i64 %\(p)lbyte_\(i)_\(elem)\n"
@@ -1736,7 +1742,7 @@ extension AttentionKernel {
     derivScale: Float,
     dBufferName: String,       // D buffer pointer (e.g., "%D_buf")
     traversalOffset: String,   // loop variable for traversal offset (e.g., "%bkv_r")
-    traversalDim: UInt32,      // total traversal dimension (R)
+    traversalDim: String,      // total traversal dimension (R)
     memD: GEMMOperandPrecision,
     pSource: String,  // SSA prefix for P vectors (e.g., "bkv_sf_p" → %bkv_sf_p_0)
     dpSource: String  // SSA prefix for dP vectors (e.g., "dp_final" → %dp_final_0)
@@ -1764,7 +1770,8 @@ extension AttentionKernel {
         ir += "  %\(p)didx_\(i)_\(elem) = add i32 %\(p)tbase_\(i), %\(p)mxe_\(i)_\(elem)\n"
         // Clamp to bounds
         ir += "  %\(p)dcmp_\(i)_\(elem) = icmp ult i32 %\(p)didx_\(i)_\(elem), \(traversalDim)\n"
-        ir += "  %\(p)dsafe_\(i)_\(elem) = select i1 %\(p)dcmp_\(i)_\(elem), i32 %\(p)didx_\(i)_\(elem), i32 \(traversalDim - 1)\n"
+        ir += "  %\(p)ddm1_\(i)_\(elem) = sub i32 \(traversalDim), 1\n"
+        ir += "  %\(p)dsafe_\(i)_\(elem) = select i1 %\(p)dcmp_\(i)_\(elem), i32 %\(p)didx_\(i)_\(elem), i32 %\(p)ddm1_\(i)_\(elem)\n"
         ir += "  %\(p)doff_\(i)_\(elem) = zext i32 %\(p)dsafe_\(i)_\(elem) to i64\n"
         ir += "  %\(p)dbyte_\(i)_\(elem) = mul i64 %\(p)doff_\(i)_\(elem), \(elemSizeD)\n"
         ir += "  %\(p)dptr_\(i)_\(elem) = getelementptr i8, i8 addrspace(1)* \(dBufferName), i64 %\(p)dbyte_\(i)_\(elem)\n"
@@ -1829,7 +1836,7 @@ extension AttentionKernel {
     prefix p: String,
     D: UInt32, paddedD: UInt32, blockH: UInt16,
     headLoopFloor: UInt32, headEdge: UInt32,
-    parallelDim: UInt32,
+    parallelDim: String,
     cachedO: Bool, cacheddO: Bool,
     leadingDimO: UInt32, leadingDimdO: UInt32,
     memO: GEMMOperandPrecision, regO: GEMMOperandPrecision,
@@ -1972,7 +1979,7 @@ extension AttentionKernel {
     bufferName: String,
     resultName: String,
     traversalOffset: String,
-    traversalDim: UInt32,
+    traversalDim: String,
     blockT: UInt16,
     memPrec: GEMMOperandPrecision
   ) -> String {
@@ -2025,7 +2032,7 @@ extension AttentionKernel {
     blockP: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32,
+    parallelDim: String,
     regPrec: GEMMOperandPrecision, memPrec: GEMMOperandPrecision,
     leadingDim: UInt32, leadingBlockDim: UInt32,
     transposed: Bool,
@@ -2199,7 +2206,7 @@ extension AttentionKernel {
     blockP: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32,
+    parallelDim: String,
     regdQ: GEMMOperandPrecision, memdQ: GEMMOperandPrecision,
     memD: GEMMOperandPrecision,
     leadingDimdQ: UInt32, leadingBlockDimdQ: UInt32,
@@ -2271,7 +2278,7 @@ extension AttentionKernel {
     blockP: UInt16, blockH: UInt16,
     D: UInt32, paddedD: UInt32, headEdge: UInt32,
     headLoopFloor: UInt32,
-    parallelDim: UInt32,
+    parallelDim: String,
     regdK: GEMMOperandPrecision, memdK: GEMMOperandPrecision,
     regdV: GEMMOperandPrecision, memdV: GEMMOperandPrecision,
     leadingDimdK: UInt32, leadingBlockDimdK: UInt32,
