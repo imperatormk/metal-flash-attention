@@ -91,9 +91,6 @@ extension GEMMKernel {
       // Generate monolithic LLVM IR and assemble in-process.
       let ir = kernel.createMonolithicIR(descriptor: monoDesc)
 
-      // Debug: dump IR for analysis
-      let irDumpPath = "/tmp/mfa_gemm_debug.ll"
-      try! ir.write(toFile: irDumpPath, atomically: true, encoding: .utf8)
 
       #if os(macOS)
       let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
@@ -101,16 +98,10 @@ extension GEMMKernel {
       let metallibData = try! MetalASM.assemble(ir: ir, platform: .iOS(version: 26))
       #endif
 
-      // Write to temp file and load via URL to avoid in-memory data issues.
-      guard let matrixDimensions = descriptor.matrixDimensions,
-            let ts = descriptor.transposeState else {
-        fatalError("Descriptor was incomplete.")
+      let dispatchData = metallibData.withUnsafeBytes {
+        DispatchData(bytes: $0)
       }
-      let tA = ts.A ? "T" : "N"
-      let tB = ts.B ? "T" : "N"
-      let metallibPath = "/tmp/mfa_gemm_\(matrixDimensions.M)x\(matrixDimensions.N)x\(matrixDimensions.K)_\(tA)\(tB)_\(kernelDescriptor.blockDimensions!.M)x\(kernelDescriptor.blockDimensions!.N)x\(kernelDescriptor.blockDimensions!.K).metallib"
-      try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
-      let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+      let library = try! device.makeLibrary(data: dispatchData)
       let function = library.makeFunction(name: "gemm")!
       let pipeline = try! device.makeComputePipelineState(function: function)
 
