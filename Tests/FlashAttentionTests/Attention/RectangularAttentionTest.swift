@@ -446,7 +446,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
 #endif
   
   var errorCount: Int = .zero
-  func check(expected: [Float], actual: [Float], tolerance: Float, label: String = "") {
+  func check(expected: [Float], actual: [Float], tolerance: Float) {
     guard expected.count == actual.count else {
       fatalError("Arrays had different length.")
     }
@@ -463,7 +463,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
         // Update the error count in the outer scope.
         if errorCount < 10 {
           errorCount += 1
-          print("error[\(label)]: \(error) / ~1.000")
+          print("error: \(error) / ~1.000")
           print("- expected[\(i)] = \(expected[i])")
           print("-   actual[\(i)] = \(actual[i])")
           print("- test configuration: \(descriptor)")
@@ -488,11 +488,11 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
       check(expected: dQ, actual: resultDerivativeQ, tolerance: 5e-2)
     }
   } else {
-    check(expected: O, actual: resultO, tolerance: 2e-5, label: "O")
-    check(expected: L, actual: resultL, tolerance: 2e-5, label: "L")
-    check(expected: D, actual: resultD, tolerance: 2e-5, label: "D")
-    check(expected: dV, actual: resultDerivativeV, tolerance: 2e-5, label: "dV")
-    check(expected: dK, actual: resultDerivativeK, tolerance: 2e-5, label: "dK")
-    check(expected: dQ, actual: resultDerivativeQ, tolerance: 2e-5, label: "dQ")
+    check(expected: O, actual: resultO, tolerance: 2e-5)
+    check(expected: L, actual: resultL, tolerance: 2e-5)
+    check(expected: D, actual: resultD, tolerance: 2e-5)
+    check(expected: dV, actual: resultDerivativeV, tolerance: 2e-5)
+    check(expected: dK, actual: resultDerivativeK, tolerance: 2e-5)
+    check(expected: dQ, actual: resultDerivativeQ, tolerance: 2e-5)
   }
 }
