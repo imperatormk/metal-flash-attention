@@ -132,20 +132,20 @@ extension AttentionKernel {
         uint D_offset = \(truncatedHeadDimension);
         uint R_offset = \(parallelizationGroupOffset);
         uint2 offset_src(D_offset, R_offset);
-
+        
         auto dO_src = simdgroup_matrix_storage<\(memoryName(.dO))>
         ::apply_offset(
-          dO, \(leadingDimension(.dO)),
+          dO, \(leadingDimension(.dO)), 
           offset_src, \(transposed(.dO)));
         auto O_src = simdgroup_matrix_storage<\(memoryName(.O))>
         ::apply_offset(
-          O, \(leadingDimension(.O)),
+          O, \(leadingDimension(.O)), 
           offset_src, \(transposed(.O)));
-
+        
         auto dO_dst = (threadgroup \(memoryName(.dO))*)(threadgroup_block);
         auto O_dst = (threadgroup \(memoryName(.O))*)(
           threadgroup_block + \(blockBytesDerivativeO()));
-
+        
         ushort D_src_dimension = \(headDimension) % 8;
         ushort D_dst_dimension = 8;
         ushort R_dimension = min(
@@ -153,17 +153,15 @@ extension AttentionKernel {
           uint(\(parallelizationDimension) - \(parallelizationGroupOffset)));
         ushort2 tile_src(D_src_dimension, R_dimension);
         ushort2 tile_dst(D_dst_dimension, R_dimension);
-
+        
         // Issue two async copies.
         simdgroup_event events[2];
         events[0].async_copy(
           dO_dst, \(leadingBlockDimension(.dO)), tile_dst,
-          dO_src, \(leadingDimension(.dO)), tile_src,
-          \(transposed(.dO)));
+          dO_src, \(leadingDimension(.dO)), tile_src, \(transposed(.dO)));
         events[1].async_copy(
           O_dst, \(leadingBlockDimension(.O)), tile_dst,
-          O_src, \(leadingDimension(.O)), tile_src,
-          \(transposed(.O)));
+          O_src, \(leadingDimension(.O)), tile_src, \(transposed(.O)));
         simdgroup_event::wait(2, events);
       }
       
@@ -357,20 +355,20 @@ extension AttentionKernel {
     
     func loadOperand() -> String {
       """
-
+      
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (sidx == 0) {
         auto \(operand)_src = \(operand) + \(traversalOffset);
         auto \(operand)_dst =
         (threadgroup \(memoryName(operand))*)(threadgroup_block);
-
+        
         ushort R_src_dimension = min(
           uint(\(blockDimensions.traversal)),
           uint(\(traversalDimension) - \(traversalOffset)));
         ushort R_dst_dimension = max(
           ushort(\(paddedTraversalEdge)),
           ushort(R_src_dimension));
-
+        
         // Issue an async copy.
         simdgroup_event event;
         event.async_copy(
@@ -378,7 +376,7 @@ extension AttentionKernel {
           \(operand)_src, 1, ushort2(R_src_dimension, 1));
         simdgroup_event::wait(1, &event);
       }
-
+      
       """
     }
     

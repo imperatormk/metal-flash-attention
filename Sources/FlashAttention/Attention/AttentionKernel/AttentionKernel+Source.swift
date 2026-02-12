@@ -1,5 +1,5 @@
 //
-//  AttentionKernel+MonolithicIR.swift
+//  AttentionKernel+Source.swift
 //  FlashAttention
 //
 //  Generates a complete monolithic LLVM IR kernel for attention.
@@ -27,8 +27,8 @@ extension AttentionKernel {
   ///
   /// The returned string can be passed directly to `MetalASM.assemble(ir:)`
   /// to produce a metallib loadable via `MTLDevice.makeLibrary(data:)`.
-  public func createMonolithicIR(descriptor desc: MonolithicDescriptor) -> String {
-    print("[MonolithicIR] type=\(type) R=\(desc.R) C=\(desc.C) D=\(headDimension) blockP=\(blockDimensions.parallelization) blockT=\(blockDimensions.traversal) blockH=\(blockDimensions.head) cached=\(cacheState)")
+  public func createSource(descriptor desc: MonolithicDescriptor) -> String {
+
     let R = desc.R
     let C = desc.C
     let D = UInt32(headDimension)

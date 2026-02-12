@@ -89,7 +89,7 @@ extension GEMMKernel {
         matrixDimensions.M, matrixDimensions.N)
 
       // Generate monolithic LLVM IR and assemble in-process.
-      let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+      let ir = kernel.createSource(descriptor: monoDesc)
 
 
       #if os(macOS)

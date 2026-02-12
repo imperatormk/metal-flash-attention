@@ -112,7 +112,7 @@ namespace metal
     clamp_to_zero = 0,
     clamp_to_edge = 1
   };
-
+  
   struct simdgroup_event {
     METAL_FUNC simdgroup_event() thread {}
 
@@ -126,13 +126,13 @@ namespace metal
         // Description of the data type.
         sizeof(T),
         alignof(T),
-
+        
         // Description of the arguments.
         reinterpret_cast<threadgroup void *>(dst),
         reinterpret_cast<const device void *>(src),
         n_elements);
     }
-
+    
     template <typename T>
     METAL_FUNC void async_copy(
       device T *dst,
@@ -143,13 +143,13 @@ namespace metal
         // Description of the data type.
         sizeof(T),
         alignof(T),
-
+        
         // Description of the arguments.
         reinterpret_cast<device void *>(dst),
         reinterpret_cast<const threadgroup void *>(src),
         n_elements);
     }
-
+    
     template <typename T>
     METAL_FUNC void async_copy(
       // Description of the destination.
@@ -192,7 +192,7 @@ namespace metal
         long2(0),
         static_cast<int>(clamp_mode));
     }
-
+    
     template <typename T>
     METAL_FUNC void async_copy(
       // Description of the destination.
@@ -233,12 +233,12 @@ namespace metal
         long2(0),
         0);
     }
-
+    
     METAL_FUNC static void wait(int count, thread simdgroup_event *events) {
       __metal_wait_simdgroup_events(
         count, reinterpret_cast<thread _simdgroup_event_t**>(events));
     }
-
+    
   private:
     // Invoking the generation of LLVM bitcode for async copies.
     //

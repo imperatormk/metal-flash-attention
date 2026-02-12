@@ -1,5 +1,5 @@
 //
-//  GEMMKernel+MonolithicIR.swift
+//  GEMMKernel+Source.swift
 //  FlashAttention
 //
 //  Generates a complete monolithic LLVM IR kernel for GEMM.
@@ -30,7 +30,7 @@ extension GEMMKernel {
   ///
   /// The returned string can be passed directly to `MetalASM.assemble(ir:)`
   /// to produce a metallib loadable via `MTLDevice.makeLibrary(data:)`.
-  public func createMonolithicIR(descriptor desc: MonolithicDescriptor) -> String {
+  public func createSource(descriptor desc: MonolithicDescriptor) -> String {
     let M = desc.M
     let N = desc.N
     let K = desc.K

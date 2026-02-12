@@ -101,7 +101,7 @@ extension AttentionKernel {
     let kernelDesc = descriptor.kernelDescriptor(type: type)
     let kernel = AttentionKernel(descriptor: kernelDesc)
 
-    let ir = kernel.createMonolithicIR(descriptor: monoDesc)
+    let ir = kernel.createSource(descriptor: monoDesc)
     let t2 = CFAbsoluteTimeGetCurrent()
 
     #if os(macOS)
