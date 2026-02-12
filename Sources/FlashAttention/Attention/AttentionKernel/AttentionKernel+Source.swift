@@ -172,20 +172,24 @@ extension AttentionKernel {
       ir += "  \(decl)\n"
     }
 
-    // Kernel function signature: 10 device buffers + 1 TG buffer + gid + sidx + lane_id
+    // Kernel function signature: 11 device buffers + 1 TG buffer + gid + sidx + lane_id
+    // Buffer 10 = batch_params: [numHeads, kvRepeatFactor, Q_stride, K_stride,
+    //   V_stride, O_stride, L_stride, D_stride, dO_stride, dV_stride, dK_stride,
+    //   dQ_stride, causalOffset]
     ir += """
 
     define void @attention(
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %Q,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %K,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %V,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %O,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %L_buf,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %D_buf,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %dO,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %dV,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %dK,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %dQ,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %Q_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %K_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %V_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %O_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %L_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %D_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %dO_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %dV_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %dK_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %dQ_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %bp_raw,
         i8 addrspace(3)* noundef %tg_base,
         <3 x i32> noundef %gid,
         i16 noundef %sidx_i16,
@@ -195,12 +199,69 @@ extension AttentionKernel {
       %sidx = zext i16 %sidx_i16 to i32
       %lane_id = zext i16 %lane_id_i16 to i32
       %gid_x = extractelement <3 x i32> %gid, i64 0
+      %gid_y = extractelement <3 x i32> %gid, i64 1
 
       ; Event alloca for async copy
       %ev = alloca [2 x %event_t addrspace(3)*], align 8
       %ev_i8 = bitcast [2 x %event_t addrspace(3)*]* %ev to i8*
       call void @llvm.lifetime.start.p0i8(i64 16, i8* nonnull %ev_i8) #4
 
+      ; === Load batch params ===
+      %bp_ptr = bitcast i8 addrspace(1)* %bp_raw to i32 addrspace(1)*
+      ; bp[0] = numHeads (unused here), bp[1] = kvRepeatFactor
+      %bp_kvr_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 1
+      %kvRepeatFactor = load i32, i32 addrspace(1)* %bp_kvr_ptr
+
+      ; Head indices: q_head = gid.y, kv_head = gid.y / kvRepeatFactor
+      %batch_head_idx = bitcast i32 %gid_y to i32
+      %kv_head_idx = udiv i32 %batch_head_idx, %kvRepeatFactor
+
+      ; Load per-operand strides from bp[2..13]
+    """
+
+    ir += "\n"
+    // Stride names and bp indices
+    let strideOperands: [(name: String, bpIdx: Int)] = [
+      ("Q", 2), ("K", 3), ("V", 4), ("O", 5),
+      ("L", 6), ("D", 7), ("dO", 8), ("dV", 9), ("dK", 10), ("dQ", 11)
+    ]
+    for (name, idx) in strideOperands {
+      ir += "  %stride_\(name)_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 \(idx)\n"
+      ir += "  %stride_\(name) = load i32, i32 addrspace(1)* %stride_\(name)_ptr\n"
+    }
+
+    // Load causal offset from bp[12]
+    ir += "  %causal_off_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 12\n"
+    ir += "  %causal_offset = load i32, i32 addrspace(1)* %causal_off_ptr\n"
+    ir += "\n"
+
+    // GEP each buffer to per-head pointer
+    // Stride is in elements; multiply by element size to get byte offset.
+    // Q, O, L, D, dO, dQ use batch_head_idx; K, V, dV, dK use kv_head_idx
+    let qHeadOps = ["Q", "O", "L", "D", "dO", "dQ"]
+    let kvHeadOps = ["K", "V", "dV", "dK"]
+
+    // Map name → AttentionOperand for memSize lookup
+    let nameToOperand: [String: AttentionOperand] = [
+      "Q": .Q, "K": .K, "V": .V, "O": .O,
+      "L": .L, "D": .D, "dO": .dO, "dV": .dV, "dK": .dK, "dQ": .dQ
+    ]
+
+    for name in qHeadOps + kvHeadOps {
+      let headIdx = qHeadOps.contains(name) ? "%batch_head_idx" : "%kv_head_idx"
+      let baseName = (name == "L") ? "L_base" : (name == "D") ? "D_base" : "\(name)_base"
+      let elemBytes = memSize(nameToOperand[name]!)
+      ir += "  %off_\(name)_elem = mul i32 \(headIdx), %stride_\(name)\n"
+      ir += "  %off_\(name)_32 = mul i32 %off_\(name)_elem, \(elemBytes)\n"
+      ir += "  %off_\(name) = zext i32 %off_\(name)_32 to i64\n"
+      ir += "  %\(name) = getelementptr i8, i8 addrspace(1)* %\(baseName), i64 %off_\(name)\n"
+    }
+    // Alias L → L_buf, D → D_buf for compatibility with rest of IR
+    ir += "  %L_buf = bitcast i8 addrspace(1)* %L to i8 addrspace(1)*\n"
+    ir += "  %D_buf = bitcast i8 addrspace(1)* %D to i8 addrspace(1)*\n"
+    ir += "\n"
+
+    ir += """
       ; === Morton order computation ===
       %q = lshr i32 %lane_id, 2
       %m_floor = and i32 %q, 16380
@@ -234,6 +295,9 @@ extension AttentionKernel {
       %par_dim_m1 = sub i32 \(parallelDim), 1
       %par_cmp = icmp ult i32 %unsafe_par_off, \(parallelDim)
       %clamped_par_off = select i1 %par_cmp, i32 %unsafe_par_off, i32 %par_dim_m1
+
+      ; causal_row = unsafe_par_off + causal_offset
+      %causal_row = add i32 %unsafe_par_off, %causal_offset
 
     """
 
