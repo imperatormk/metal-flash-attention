@@ -88,19 +88,10 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
     monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
     monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
 
-    let ir = kernel.createMonolithicIR(descriptor: monoDesc)
-    let typeName: String
-    switch type {
-    case .forward: typeName = "fwd"
-    case .backwardQuery: typeName = "bwd_q"
-    case .backwardKeyValue: typeName = "bwd_kv"
-    }
-    let irPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).ll"
-    try! ir.write(toFile: irPath, atomically: true, encoding: .utf8)
+    let ir = kernel.createSource(descriptor: monoDesc)
     let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
-    let metallibPath = "/tmp/mfa_attn_\(R)x\(C)x\(matrixDimensions.head)_\(typeName).metallib"
-    try! metallibData.write(to: URL(fileURLWithPath: metallibPath))
-    let library = try! device.makeLibrary(URL: URL(fileURLWithPath: metallibPath))
+    let dispatchData = metallibData.withUnsafeBytes { DispatchData(bytes: $0) }
+    let library = try! device.makeLibrary(data: dispatchData)
     let function = library.makeFunction(name: "attention")!
     return try! device.makeComputePipelineState(function: function)
   }
