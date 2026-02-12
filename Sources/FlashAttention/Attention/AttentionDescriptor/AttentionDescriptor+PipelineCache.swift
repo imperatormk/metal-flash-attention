@@ -135,11 +135,12 @@ extension AttentionKernel {
 
 // MARK: - Dispatch Helpers
 
-/// BatchedParams buffer layout (13 x UInt32 = 52 bytes):
+/// BatchedParams buffer layout (15 x UInt32 = 60 bytes):
 /// [numHeads, kvRepeatFactor, Q_stride, K_stride, V_stride, O_stride, L_stride, D_stride,
-///  dO_stride, dV_stride, dK_stride, dQ_stride, causalOffset]
+///  dO_stride, dV_stride, dK_stride, dQ_stride, causalOffset, R, C]
 /// Strides are in elements (not bytes). For single-head: numHeads=1, all strides=0.
 /// causalOffset: added to row index for causal masking (for chunked prefill where R < C).
+/// R, C at bp[13..14]: used by dynamicRC kernels to avoid recompilation when dimensions change.
 /// For GQA: kvRepeatFactor = numHeads / numKVHeads. K/V use kv_head_idx = q_head / kvRepeatFactor.
 extension AttentionKernel {
 
@@ -175,7 +176,8 @@ extension AttentionKernel {
       qStride, kStride, vStride, oStride,
       lStride, dStride,
       doStride, dvStride, dkStride, dqStride,
-      causalOffset
+      causalOffset,
+      R, C  // bp[13], bp[14]: used by dynamicRC kernels
     ]
     return MTLContext.global.device.makeBuffer(
       bytes: &params, length: params.count * 4,
