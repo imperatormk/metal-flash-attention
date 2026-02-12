@@ -178,7 +178,8 @@ extension AttentionKernel {
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%bq_c",
-      regS: regS, scaleFactor: scaleFactor
+      regS: regS, scaleFactor: scaleFactor,
+      causal: causal
     )
 
     // Step 2: P = exp2(S * scaleFactor - L)
@@ -433,7 +434,9 @@ extension AttentionKernel {
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%bkv_r",
-      regS: regS, scaleFactor: scaleFactor
+      regS: regS, scaleFactor: scaleFactor,
+      causal: causal,
+      causalTransposed: true
     )
 
     // Step 2: P^T = exp2(S^T * scaleFactor - L)

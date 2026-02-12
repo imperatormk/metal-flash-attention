@@ -187,7 +187,8 @@ extension AttentionKernel {
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%c",
-      regS: regS, scaleFactor: scaleFactor
+      regS: regS, scaleFactor: scaleFactor,
+      causal: causal
     )
 
     // MARK: - Online Softmax: Reduce Maximum

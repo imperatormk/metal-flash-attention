@@ -704,7 +704,9 @@ extension AttentionKernel {
     blockT: UInt16, traversalDim: UInt32,
     traversalOffset: String,
     regS: GEMMOperandPrecision,
-    scaleFactor: Float
+    scaleFactor: Float,
+    causal: Bool = false,
+    causalTransposed: Bool = false
   ) -> String {
     let logBase2E: Float = 1.442695041
     let t = irTypeName(regS)
@@ -714,24 +716,17 @@ extension AttentionKernel {
 
     // remainder = traversalDim % blockT
     let remainder = traversalDim % UInt32(blockT)
-    if remainder == 0 {
-      // No masking needed when traversal is perfectly divisible
-      // But we still need to handle the case at runtime
-      ir += "  ; No edge masking needed (traversalDim divisible by blockT)\n"
+    let needsEdgeMask = remainder != 0
+
+    if !needsEdgeMask && !causal {
+      ir += "  ; No masking needed\n"
       for i in 0..<sSramCount {
         ir += "  %\(p)s_\(i) = bitcast \(irVecType(regS)) %s_final_\(i) to \(irVecType(regS))\n"
       }
       return ir
     }
 
-    // Check if this is an edge iteration
-    let blockEnd = "%\(p)block_end"
-    ir += "  \(blockEnd) = add i32 \(traversalOffset), \(blockT)\n"
-    ir += "  %\(p)is_edge = icmp ugt i32 \(blockEnd), \(traversalDim)\n"
-    ir += "  br i1 %\(p)is_edge, label %\(p)do_mask, label %\(p)skip_mask\n\n"
-
-    ir += "\(p)do_mask:\n"
-    // mask_value = (0.875 / logBase2E) * -FLT_MAX
+    // Compute mask value (shared by edge and causal masking)
     let maskValue: Float = (0.875 / logBase2E) * -Float.greatestFiniteMagnitude
     ir += "  %\(p)mask_val_f32 = bitcast i32 \(maskValue.bitPattern) to float\n"
     let maskValName: String
@@ -742,60 +737,87 @@ extension AttentionKernel {
       ir += "  \(maskValName) = fptrunc float %\(p)mask_val_f32 to \(irTypeName(regS))\n"
     }
 
-    // Compute which elements to mask
-    // remainder_rt = traversalDim - traversalOffset (runtime remainder)
-    ir += "  %\(p)rem_rt = sub i32 \(traversalDim), \(traversalOffset)\n"
-    // remainderFloor = rem_rt - (rem_rt % 8)
-    ir += "  %\(p)rem_mod8 = and i32 %\(p)rem_rt, 7\n"
-    ir += "  %\(p)rem_floor = sub i32 %\(p)rem_rt, %\(p)rem_mod8\n"
+    // --- Edge masking ---
+    // The "edge_" prefix values are the result after edge masking (or identity if no edge mask)
+    if needsEdgeMask {
+      let blockEnd = "%\(p)block_end"
+      ir += "  \(blockEnd) = add i32 \(traversalOffset), \(blockT)\n"
+      ir += "  %\(p)is_edge = icmp ugt i32 \(blockEnd), \(traversalDim)\n"
+      ir += "  br i1 %\(p)is_edge, label %\(p)do_mask, label %\(p)skip_mask\n\n"
 
-    // For the block at remainderFloor/8, mask elements where morton_x + index >= remainder - remainderFloor
-    // For blocks after remainderFloor, mask all elements
-    for i in 0..<sSramCount {
-      let blockStart = i * 8
-      // If blockStart >= rem_rt, mask everything
-      ir += "  %\(p)bs_\(i) = icmp uge i32 \(blockStart), %\(p)rem_rt\n"
+      ir += "\(p)do_mask:\n"
+      ir += "  %\(p)rem_rt = sub i32 \(traversalDim), \(traversalOffset)\n"
+      ir += "  %\(p)rem_mod8 = and i32 %\(p)rem_rt, 7\n"
+      ir += "  %\(p)rem_floor = sub i32 %\(p)rem_rt, %\(p)rem_mod8\n"
 
-      // Extract the 2 thread elements
-      ir += "  %\(p)e0_\(i) = extractelement \(irVecType(regS)) %s_final_\(i), i32 0\n"
-      ir += "  %\(p)e1_\(i) = extractelement \(irVecType(regS)) %s_final_\(i), i32 1\n"
+      for i in 0..<sSramCount {
+        let blockStart = i * 8
+        ir += "  %\(p)bs_\(i) = icmp uge i32 \(blockStart), %\(p)rem_rt\n"
+        ir += "  %\(p)e0_\(i) = extractelement \(irVecType(regS)) %s_final_\(i), i32 0\n"
+        ir += "  %\(p)e1_\(i) = extractelement \(irVecType(regS)) %s_final_\(i), i32 1\n"
+        ir += "  %\(p)is_edge_blk_\(i) = icmp eq i32 \(blockStart), %\(p)rem_floor\n"
+        ir += "  %\(p)e0_oob_\(i) = icmp uge i32 %morton_x, %\(p)rem_mod8\n"
+        ir += "  %\(p)e0_mask_\(i) = and i1 %\(p)is_edge_blk_\(i), %\(p)e0_oob_\(i)\n"
+        ir += "  %\(p)mx_p1_\(i) = add i32 %morton_x, 1\n"
+        ir += "  %\(p)e1_oob_\(i) = icmp uge i32 %\(p)mx_p1_\(i), %\(p)rem_mod8\n"
+        ir += "  %\(p)e1_mask_\(i) = and i1 %\(p)is_edge_blk_\(i), %\(p)e1_oob_\(i)\n"
+        ir += "  %\(p)m0_\(i) = or i1 %\(p)bs_\(i), %\(p)e0_mask_\(i)\n"
+        ir += "  %\(p)m1_\(i) = or i1 %\(p)bs_\(i), %\(p)e1_mask_\(i)\n"
+        ir += "  %\(p)me0_\(i) = select i1 %\(p)m0_\(i), \(t) \(maskValName), \(t) %\(p)e0_\(i)\n"
+        ir += "  %\(p)me1_\(i) = select i1 %\(p)m1_\(i), \(t) \(maskValName), \(t) %\(p)e1_\(i)\n"
+        ir += "  %\(p)sv0_\(i) = insertelement \(irVecType(regS)) %s_final_\(i), \(t) %\(p)me0_\(i), i32 0\n"
+        ir += "  %\(p)masked_\(i) = insertelement \(irVecType(regS)) %\(p)sv0_\(i), \(t) %\(p)me1_\(i), i32 1\n"
+      }
 
-      // For the edge block (blockStart == remainderFloor):
-      // mask element if morton_x + index >= (rem_rt - remainderFloor)
-      ir += "  %\(p)is_edge_blk_\(i) = icmp eq i32 \(blockStart), %\(p)rem_floor\n"
+      ir += "  br label %\(p)after_mask\n\n"
+      ir += "\(p)skip_mask:\n"
+      ir += "  br label %\(p)after_mask\n\n"
+      ir += "\(p)after_mask:\n"
 
-      // element 0: mask if morton_x + 0 >= rem_mod8
-      ir += "  %\(p)e0_oob_\(i) = icmp uge i32 %morton_x, %\(p)rem_mod8\n"
-      ir += "  %\(p)e0_mask_\(i) = and i1 %\(p)is_edge_blk_\(i), %\(p)e0_oob_\(i)\n"
-      // element 1: mask if morton_x + 1 >= rem_mod8
-      ir += "  %\(p)mx_p1_\(i) = add i32 %morton_x, 1\n"
-      ir += "  %\(p)e1_oob_\(i) = icmp uge i32 %\(p)mx_p1_\(i), %\(p)rem_mod8\n"
-      ir += "  %\(p)e1_mask_\(i) = and i1 %\(p)is_edge_blk_\(i), %\(p)e1_oob_\(i)\n"
-
-      // Combine: mask if full block OOB or individual element OOB
-      ir += "  %\(p)m0_\(i) = or i1 %\(p)bs_\(i), %\(p)e0_mask_\(i)\n"
-      ir += "  %\(p)m1_\(i) = or i1 %\(p)bs_\(i), %\(p)e1_mask_\(i)\n"
-
-      // Select masked values
-      let maskCast = maskValName
-      ir += "  %\(p)me0_\(i) = select i1 %\(p)m0_\(i), \(t) \(maskCast), \(t) %\(p)e0_\(i)\n"
-      ir += "  %\(p)me1_\(i) = select i1 %\(p)m1_\(i), \(t) \(maskCast), \(t) %\(p)e1_\(i)\n"
-
-      // Reconstruct <64 x T>
-      ir += "  %\(p)sv0_\(i) = insertelement \(irVecType(regS)) %s_final_\(i), \(t) %\(p)me0_\(i), i32 0\n"
-      ir += "  %\(p)masked_\(i) = insertelement \(irVecType(regS)) %\(p)sv0_\(i), \(t) %\(p)me1_\(i), i32 1\n"
+      for i in 0..<sSramCount {
+        ir += "  %\(p)edge_\(i) = phi \(irVecType(regS)) [%\(p)masked_\(i), %\(p)do_mask], [%s_final_\(i), %\(p)skip_mask]\n"
+      }
+      ir += "\n"
+    } else {
+      // No edge masking needed — alias
+      for i in 0..<sSramCount {
+        ir += "  %\(p)edge_\(i) = bitcast \(irVecType(regS)) %s_final_\(i) to \(irVecType(regS))\n"
+      }
     }
 
-    ir += "  br label %\(p)after_mask\n\n"
-    ir += "\(p)skip_mask:\n"
-    ir += "  br label %\(p)after_mask\n\n"
-    ir += "\(p)after_mask:\n"
+    // --- Causal masking ---
+    if causal {
+      ir += "  ; === Causal masking ===\n"
+      for i in 0..<sSramCount {
+        let blockStart = i * 8
+        ir += "  %\(p)col0_\(i) = add i32 \(traversalOffset), \(blockStart)\n"
+        ir += "  %\(p)col0m_\(i) = add i32 %\(p)col0_\(i), %morton_x\n"
+        ir += "  %\(p)col1m_\(i) = add i32 %\(p)col0m_\(i), 1\n"
+        ir += "  %\(p)ce0_\(i) = extractelement \(irVecType(regS)) %\(p)edge_\(i), i32 0\n"
+        ir += "  %\(p)ce1_\(i) = extractelement \(irVecType(regS)) %\(p)edge_\(i), i32 1\n"
 
-    // Phi nodes
-    for i in 0..<sSramCount {
-      ir += "  %\(p)s_\(i) = phi \(irVecType(regS)) [%\(p)masked_\(i), %\(p)do_mask], [%s_final_\(i), %\(p)skip_mask]\n"
+        if causalTransposed {
+          // S^T[k,q]: mask where k > q (row > col), using causal_row for offset support
+          ir += "  %\(p)cm0_\(i) = icmp ugt i32 %causal_row, %\(p)col0m_\(i)\n"
+          ir += "  %\(p)cm1_\(i) = icmp ugt i32 %causal_row, %\(p)col1m_\(i)\n"
+        } else {
+          // S[q,k]: mask where k > q (col > row), using causal_row for offset support
+          ir += "  %\(p)cm0_\(i) = icmp ugt i32 %\(p)col0m_\(i), %causal_row\n"
+          ir += "  %\(p)cm1_\(i) = icmp ugt i32 %\(p)col1m_\(i), %causal_row\n"
+        }
+
+        ir += "  %\(p)cf0_\(i) = select i1 %\(p)cm0_\(i), \(t) \(maskValName), \(t) %\(p)ce0_\(i)\n"
+        ir += "  %\(p)cf1_\(i) = select i1 %\(p)cm1_\(i), \(t) \(maskValName), \(t) %\(p)ce1_\(i)\n"
+        ir += "  %\(p)cv0_\(i) = insertelement \(irVecType(regS)) %\(p)edge_\(i), \(t) %\(p)cf0_\(i), i32 0\n"
+        ir += "  %\(p)s_\(i) = insertelement \(irVecType(regS)) %\(p)cv0_\(i), \(t) %\(p)cf1_\(i), i32 1\n"
+      }
+      ir += "\n"
+    } else {
+      // No causal — alias edge to final
+      for i in 0..<sSramCount {
+        ir += "  %\(p)s_\(i) = bitcast \(irVecType(regS)) %\(p)edge_\(i) to \(irVecType(regS))\n"
+      }
     }
-    ir += "\n"
 
     return ir
   }

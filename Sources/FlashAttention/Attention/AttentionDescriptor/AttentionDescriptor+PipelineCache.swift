@@ -132,3 +132,82 @@ extension AttentionKernel {
     pipelineCache[descriptor]![type] = (kernel, pipeline)
   }
 }
+
+// MARK: - Dispatch Helpers
+
+/// BatchedParams buffer layout (13 x UInt32 = 52 bytes):
+/// [numHeads, kvRepeatFactor, Q_stride, K_stride, V_stride, O_stride, L_stride, D_stride,
+///  dO_stride, dV_stride, dK_stride, dQ_stride, causalOffset]
+/// Strides are in elements (not bytes). For single-head: numHeads=1, all strides=0.
+/// causalOffset: added to row index for causal masking (for chunked prefill where R < C).
+/// For GQA: kvRepeatFactor = numHeads / numKVHeads. K/V use kv_head_idx = q_head / kvRepeatFactor.
+extension AttentionKernel {
+
+  /// Create a BatchedParams MTLBuffer for multi-head batched attention.
+  /// - Parameters:
+  ///   - numHeads: Number of query attention heads.
+  ///   - numKVHeads: Number of key/value heads (defaults to numHeads for MHA).
+  ///   - R: Row sequence length.
+  ///   - C: Column sequence length.
+  ///   - D: Head dimension.
+  /// - Returns: MTLBuffer containing the BatchedParams struct.
+  public static func createBatchedParamsBuffer(
+    numHeads: UInt32, numKVHeads: UInt32? = nil, R: UInt32, C: UInt32, D: UInt32,
+    causalOffset: UInt32 = 0
+  ) -> MTLBuffer {
+    let kvHeads = numKVHeads ?? numHeads
+    let kvRepeatFactor = numHeads / kvHeads
+
+    // Strides = per-head element count for each operand
+    let qStride = R * D
+    let kStride = C * D
+    let vStride = C * D
+    let oStride = R * D
+    let lStride = R
+    let dStride = R
+    let doStride = R * D
+    let dvStride = C * D
+    let dkStride = C * D
+    let dqStride = R * D
+
+    var params: [UInt32] = [
+      numHeads, kvRepeatFactor,
+      qStride, kStride, vStride, oStride,
+      lStride, dStride,
+      doStride, dvStride, dkStride, dqStride,
+      causalOffset
+    ]
+    return MTLContext.global.device.makeBuffer(
+      bytes: &params, length: params.count * 4,
+      options: .storageModeShared)!
+  }
+
+  /// Dispatch an attention kernel with multi-head batched support.
+  public static func dispatch(
+    encoder: MTLComputeCommandEncoder,
+    kernel: AttentionKernel,
+    pipeline: MTLComputePipelineState,
+    batchedParams: MTLBuffer,
+    parallelizationDimension: Int,
+    numHeads: Int = 1,
+    batchSize: Int = 1
+  ) {
+    encoder.setComputePipelineState(pipeline)
+    encoder.setThreadgroupMemoryLength(
+      Int(kernel.threadgroupMemoryAllocation), index: 0)
+    encoder.setBuffer(batchedParams, offset: 0, index: 10)
+
+    let blockCount = (parallelizationDimension + Int(kernel.blockDimensions.parallelization) - 1)
+      / Int(kernel.blockDimensions.parallelization)
+    let gridSize = MTLSize(
+      width: blockCount,
+      height: numHeads,
+      depth: batchSize)
+    let groupSize = MTLSize(
+      width: Int(kernel.threadgroupSize),
+      height: 1,
+      depth: 1)
+    encoder.dispatchThreadgroups(
+      gridSize, threadsPerThreadgroup: groupSize)
+  }
+}
