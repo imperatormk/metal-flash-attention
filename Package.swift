@@ -26,11 +26,7 @@ let package = Package(
     // Targets can depend on other targets in this package and products from dependencies.
     .target(
       name: "FlashAttention",
-      dependencies: ["MetalASM"],
-      resources: [
-        .copy("Resources/gemm_shell_v2.metallib"),
-        .copy("Resources/attention_shell.metallib"),
-      ]),
+      dependencies: ["MetalASM"]),
     .testTarget(
       name: "FlashAttentionTests",
       dependencies: ["FlashAttention"]),
