@@ -23,6 +23,13 @@ extension GEMMKernel {
     public var leadingDimensionC: UInt32 = 0
     public var loadPreviousC: Bool = false
 
+    /// When true, B is MLX-style 4-bit quantized:
+    /// - Buffer B becomes packed uint32 weights [N, K/8]
+    /// - Two extra buffers: scales [N, K/groupSize] f16, biases [N, K/groupSize] f16
+    /// - Dequant: float(nibble) * scale + bias
+    public var quantizedB: Bool = false
+    public var groupSize: UInt32 = 64
+
     public init() {}
   }
 
@@ -73,8 +80,14 @@ extension GEMMKernel {
     var maDeclarations = Set<String>()
     maDeclarations.insert(irMultiplyAccumulateDeclaration(A: regA, B: regB, C: regC))
 
-    // TG buffer: just enough for A block + B block (no C save area needed!)
-    let tgFloats = max(8192, (Int(threadgroupMemoryAllocation) + 128 + 3) / 4)
+    // TG buffer size. Quantized B dequants directly to registers, so no B in TG.
+    let tgAllocation: Int
+    if desc.quantizedB {
+      tgAllocation = max(Int(blockBytes("A")), Int(blockBytes("C")))
+    } else {
+      tgAllocation = Int(threadgroupMemoryAllocation)
+    }
+    let tgFloats = max(8192, (tgAllocation + 128 + 3) / 4)
 
     // MARK: - IR Generation
 
@@ -89,18 +102,38 @@ extension GEMMKernel {
       ir += "  \(decl)\n"
     }
 
-    // Kernel function signature: 3 device buffers + 1 TG buffer + gid + sidx + lane_id
-    ir += """
+    // Kernel function signature
+    if desc.quantizedB {
+      // 5 device buffers: A, W (packed uint32), scales (f16), biases (f16), C
+      ir += """
 
-    define void @gemm(
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %A,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %B,
-        i8 addrspace(1)* noundef "air-buffer-no-alias" %C,
-        i8 addrspace(3)* noundef %tg_base,
-        <3 x i32> noundef %gid,
-        i16 noundef %sidx_i16,
-        i16 noundef %lane_id_i16
-    ) local_unnamed_addr #0 {
+      define void @gemm(
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %A,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %B,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %scales_buf,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %biases_buf,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %C,
+          i8 addrspace(3)* noundef %tg_base,
+          <3 x i32> noundef %gid,
+          i16 noundef %sidx_i16,
+          i16 noundef %lane_id_i16
+      ) local_unnamed_addr #0 {
+      """
+    } else {
+      ir += """
+
+      define void @gemm(
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %A,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %B,
+          i8 addrspace(1)* noundef "air-buffer-no-alias" %C,
+          i8 addrspace(3)* noundef %tg_base,
+          <3 x i32> noundef %gid,
+          i16 noundef %sidx_i16,
+          i16 noundef %lane_id_i16
+      ) local_unnamed_addr #0 {
+      """
+    }
+    ir += """
     entry:
       %sidx = zext i16 %sidx_i16 to i32
       %lane_id = zext i16 %lane_id_i16 to i32
@@ -218,33 +251,58 @@ extension GEMMKernel {
       let kSteps = Int((kTile + 7) / 8)
       let p = "it\(iter)_"
 
-      // 1. Inline async copy for A and B (gated to sidx == 0)
-      ir += "  br i1 %is_sidx0, label %\(p)do_copy, label %\(p)skip_copy\n\n"
-      ir += "\(p)do_copy:\n"
-      ir += generateInlineDualCopy(
-        prefix: p,
-        kStart: kStart, kTile: kTile,
-        ldA: ldA, ldB: ldB,
-        M_group: M_group, N_group: N_group, K_group: K_group,
-        blockBytesA: blockBytesA,
-        M: M, N: N
-      )
-      ir += "  br label %\(p)after_copy\n\n"
-      ir += "\(p)skip_copy:\n"
-      ir += "  br label %\(p)after_copy\n\n"
-      ir += "\(p)after_copy:\n"
+      if desc.quantizedB {
+        // === Quantized path ===
+        // Async copy A only (gated to sidx == 0). B dequant happens inline in multiply.
+        ir += "  br i1 %is_sidx0, label %\(p)do_copy_a, label %\(p)skip_copy_a\n\n"
+        ir += "\(p)do_copy_a:\n"
+        ir += generateInlineACopyOnly(
+          prefix: p,
+          kStart: kStart, kTile: kTile,
+          ldA: ldA,
+          M_group: M_group, K_group: K_group,
+          M: M
+        )
+        ir += "  br label %\(p)after_copy_a\n\n"
+        ir += "\(p)skip_copy_a:\n"
+        ir += "  br label %\(p)after_copy_a\n\n"
+        ir += "\(p)after_copy_a:\n"
 
-      // 2. Barrier after copy (all threads must wait)
-      ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+        // Barrier after A copy (all threads must wait for A in TG)
+        ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+      } else {
+        // === Dense path ===
+        // 1. Inline async copy for A and B (gated to sidx == 0)
+        ir += "  br i1 %is_sidx0, label %\(p)do_copy, label %\(p)skip_copy\n\n"
+        ir += "\(p)do_copy:\n"
+        ir += generateInlineDualCopy(
+          prefix: p,
+          kStart: kStart, kTile: kTile,
+          ldA: ldA, ldB: ldB,
+          M_group: M_group, N_group: N_group, K_group: K_group,
+          blockBytesA: blockBytesA,
+          M: M, N: N
+        )
+        ir += "  br label %\(p)after_copy\n\n"
+        ir += "\(p)skip_copy:\n"
+        ir += "  br label %\(p)after_copy\n\n"
+        ir += "\(p)after_copy:\n"
 
-      // 3. Multiply-accumulate from TG
+        // 2. Barrier after copy (all threads must wait)
+        ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+      }
+
+      // 3. Multiply-accumulate (A from TG, B from TG or direct dequant)
       let newNames = generateInlineTGMultiply(
         prefix: p,
         kSteps: kSteps,
+        kStart: kStart,
         regM: regM, regN: regN,
         blockBytesA: blockBytesA,
         cSramCount: cSramCount,
-        cInputNames: cNames
+        cInputNames: cNames,
+        quantizedB: desc.quantizedB,
+        K: K, groupSize: desc.groupSize
       )
       ir += newNames.ir
 
@@ -327,7 +385,11 @@ extension GEMMKernel {
     """
 
     // Metadata
-    ir += irGEMMKernelMetadata() + "\n"
+    if desc.quantizedB {
+      ir += irQuantizedGEMMKernelMetadata() + "\n"
+    } else {
+      ir += irGEMMKernelMetadata() + "\n"
+    }
 
     return ir
   }
@@ -475,10 +537,14 @@ extension GEMMKernel {
   private func generateInlineTGMultiply(
     prefix p: String,
     kSteps: Int,
+    kStart: UInt32 = 0,
     regM: UInt16, regN: UInt16,
     blockBytesA: Int,
     cSramCount: Int,
-    cInputNames: [String]
+    cInputNames: [String],
+    quantizedB: Bool = false,
+    K: UInt32 = 0,
+    groupSize: UInt32 = 64
   ) -> InlineTGMultiplyResult {
     let regA = registerPrecisions.A
     let regB = registerPrecisions.B
@@ -493,9 +559,20 @@ extension GEMMKernel {
     ir += "  br i1 %out_of_bounds, label %\(p)skip_mul, label %\(p)do_mul\n\n"
     ir += "\(p)do_mul:\n"
 
-    // TG block pointers (A at offset 0, B at offset blockBytesA)
+    // TG block pointers (A at offset 0, B at offset blockBytesA only if not quantized)
     ir += "  %\(p)a_blk = getelementptr i8, i8 addrspace(3)* %tg_base, i64 0\n"
-    ir += "  %\(p)b_blk = getelementptr i8, i8 addrspace(3)* %tg_base, i64 \(blockBytesA)\n"
+    if !quantizedB {
+      ir += "  %\(p)b_blk = getelementptr i8, i8 addrspace(3)* %tg_base, i64 \(blockBytesA)\n"
+    } else {
+      // Cast device buffer pointers for direct dequant
+      let packedK = K / 8
+      let groupsPerRow = K / groupSize
+      ir += "  %\(p)dq_w_ptr = bitcast i8 addrspace(1)* %B to i32 addrspace(1)*\n"
+      ir += "  %\(p)dq_s_ptr = bitcast i8 addrspace(1)* %scales_buf to half addrspace(1)*\n"
+      ir += "  %\(p)dq_bi_ptr = bitcast i8 addrspace(1)* %biases_buf to half addrspace(1)*\n"
+      // Store constants we'll need in the dequant inline code
+      ir += "  ; packedK=\(packedK), groupsPerRow=\(groupsPerRow), groupSize=\(groupSize)\n"
+    }
 
     for k in 0..<kSteps {
       let kOff = k * 8
@@ -558,7 +635,71 @@ extension GEMMKernel {
         let bElemType = irTypeName(memB)
         let bElemSize = memB.size
 
-        if transposeState.B {
+        if quantizedB {
+          // === Direct dequant from device into registers ===
+          // Each thread needs 2 B values: (n_global, k_global) for elem 0 and 1
+          // For transposed B (W[N,K]): n_global = N_offset + oig_x + n + elem
+          //                            k_global = kStart + morton_y + kOff
+          let packedK = K / 8
+          let groupsPerRow = K / groupSize
+          let regBType = irTypeName(regB)
+
+          for elem in 0..<2 {
+            let e = "\(p)dq_\(k)_\(n)_\(elem)"
+            // n_global
+            ir += "  %\(e)_n = add i32 %N_offset, \(UInt32(n + elem))\n"
+            ir += "  %\(e)_n2 = add i32 %\(e)_n, %oig_x\n"
+            // k_global
+            ir += "  %\(e)_k = add i32 %morton_y, \(kStart + UInt32(kOff))\n"
+
+            // pack_idx = k / 8, sub_idx = k % 8
+            ir += "  %\(e)_pi = lshr i32 %\(e)_k, 3\n"
+            ir += "  %\(e)_si = and i32 %\(e)_k, 7\n"
+
+            // Load packed: W[n * packedK + pack_idx]
+            ir += "  %\(e)_wrow = mul i32 %\(e)_n2, \(packedK)\n"
+            ir += "  %\(e)_woff = add i32 %\(e)_wrow, %\(e)_pi\n"
+            ir += "  %\(e)_woff64 = zext i32 %\(e)_woff to i64\n"
+            ir += "  %\(e)_wgep = getelementptr i32, i32 addrspace(1)* %\(p)dq_w_ptr, i64 %\(e)_woff64\n"
+            ir += "  %\(e)_packed = load i32, i32 addrspace(1)* %\(e)_wgep\n"
+
+            // Extract nibble
+            ir += "  %\(e)_shift = mul i32 %\(e)_si, 4\n"
+            ir += "  %\(e)_shifted = lshr i32 %\(e)_packed, %\(e)_shift\n"
+            ir += "  %\(e)_nibble = and i32 %\(e)_shifted, 15\n"
+
+            // Scale/bias: [n * groupsPerRow + k / groupSize]
+            ir += "  %\(e)_gi = udiv i32 %\(e)_k, \(groupSize)\n"
+            ir += "  %\(e)_srow = mul i32 %\(e)_n2, \(groupsPerRow)\n"
+            ir += "  %\(e)_soff = add i32 %\(e)_srow, %\(e)_gi\n"
+            ir += "  %\(e)_soff64 = zext i32 %\(e)_soff to i64\n"
+            ir += "  %\(e)_sgep = getelementptr half, half addrspace(1)* %\(p)dq_s_ptr, i64 %\(e)_soff64\n"
+            ir += "  %\(e)_scale = load half, half addrspace(1)* %\(e)_sgep\n"
+            ir += "  %\(e)_bgep = getelementptr half, half addrspace(1)* %\(p)dq_bi_ptr, i64 %\(e)_soff64\n"
+            ir += "  %\(e)_bias = load half, half addrspace(1)* %\(e)_bgep\n"
+
+            // Dequant in f32: float(nibble) * scale + bias
+            ir += "  %\(e)_nf = uitofp i32 %\(e)_nibble to float\n"
+            ir += "  %\(e)_sf = fpext half %\(e)_scale to float\n"
+            ir += "  %\(e)_bf = fpext half %\(e)_bias to float\n"
+            ir += "  %\(e)_mul = fmul fast float %\(e)_nf, %\(e)_sf\n"
+            ir += "  %\(e)_val_f = fadd fast float %\(e)_mul, %\(e)_bf\n"
+
+            // Convert to register precision
+            if regB != .FP32 {
+              ir += "  %\(e)_val = fptrunc float %\(e)_val_f to \(regBType)\n"
+            }
+          }
+
+          // Build vec2 and shuffle to vec64
+          let e0 = "\(p)dq_\(k)_\(n)_0"
+          let e1 = "\(p)dq_\(k)_\(n)_1"
+          let valSuffix = (regB == .FP32) ? "_val_f" : "_val"
+          ir += "  %\(p)b_v2_\(k)_\(n) = insertelement <2 x \(regBType)> undef, \(regBType) %\(e0)\(valSuffix), i32 0\n"
+          ir += "  %\(p)b_v2b_\(k)_\(n) = insertelement <2 x \(regBType)> %\(p)b_v2_\(k)_\(n), \(regBType) %\(e1)\(valSuffix), i32 1\n"
+          ir += irShuffleToVec64(result: "%\(p)b_sram_\(k)_\(n)", src: "%\(p)b_v2b_\(k)_\(n)", type: regB) + "\n"
+
+        } else if transposeState.B {
           for elem in 0..<2 {
             ir += "  %\(p)b_trow_\(k)_\(n)_\(elem) = add i32 %oig_x, \(n + elem)\n"
             ir += "  %\(p)b_tcol_\(k)_\(n)_\(elem) = add i32 %morton_y, \(kOff)\n"
@@ -955,4 +1096,213 @@ extension GEMMKernel {
 
     return ir
   }
+
+  // MARK: - Inline Async Copy (A only)
+
+  /// Generate inline async copy for A only (used in quantized path).
+  /// Includes the wait but NOT the barrier (caller adds barrier after B dequant).
+  private func generateInlineACopyOnly(
+    prefix p: String,
+    kStart: UInt32, kTile: UInt32,
+    ldA: UInt32,
+    M_group: UInt16, K_group: UInt16,
+    M: UInt32
+  ) -> String {
+    let memA_size = UInt32(memoryPrecisions.A.size)
+
+    var ir = "  ; === Async copy A iter \(p) (k=\(kStart)) ===\n"
+
+    // A source offset
+    if transposeState.A {
+      ir += "  %\(p)a_row = mul i32 \(kStart), \(ldA)\n"
+      ir += "  %\(p)a_off32 = add i32 %\(p)a_row, %M_offset\n"
+    } else {
+      ir += "  %\(p)a_row = mul i32 %M_offset, \(ldA)\n"
+      ir += "  %\(p)a_off32 = add i32 %\(p)a_row, \(kStart)\n"
+    }
+    ir += "  %\(p)a_off = zext i32 %\(p)a_off32 to i64\n"
+    ir += "  %\(p)a_byte = mul i64 %\(p)a_off, \(memA_size)\n"
+    ir += "  %\(p)a_src_p = getelementptr i8, i8 addrspace(1)* %A, i64 %\(p)a_byte\n"
+
+    let aMTile = min(UInt32(M_group), M)
+    let aDstStride = UInt32(leadingBlockDimensions.A) * memA_size
+    let aSrcStride = ldA * memA_size
+
+    let (aSrcW, aSrcH, aDstW, aDstH): (String, String, UInt32, UInt32)
+    if transposeState.A {
+      aSrcW = "\(aMTile * memA_size)"
+      aSrcH = "\(kTile)"
+      aDstW = UInt32(M_group) * memA_size
+      aDstH = UInt32(K_group)
+    } else {
+      aSrcW = "\(kTile * memA_size)"
+      aSrcH = "\(aMTile)"
+      aDstW = UInt32(K_group) * memA_size
+      aDstH = UInt32(M_group)
+    }
+
+    ir += "  %\(p)a_dst_p = getelementptr i8, i8 addrspace(3)* %tg_base, i64 0\n"
+
+    ir += "  %\(p)a_stile_w = insertelement <2 x i64> zeroinitializer, i64 \(aSrcW), i32 0\n"
+    ir += "  %\(p)a_stile = insertelement <2 x i64> %\(p)a_stile_w, i64 \(aSrcH), i32 1\n"
+    ir += "  %\(p)a_dtile_w = insertelement <2 x i64> zeroinitializer, i64 \(aDstW), i32 0\n"
+    ir += "  %\(p)a_dtile = insertelement <2 x i64> %\(p)a_dtile_w, i64 \(aDstH), i32 1\n"
+
+    ir += "  %\(p)ev0p = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
+
+    ir += """
+      %\(p)a_ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p3i8.p1i8(
+        i64 1, i64 1,
+        i8 addrspace(3)* %\(p)a_dst_p, i64 \(aDstStride), i64 1, <2 x i64> %\(p)a_dtile,
+        i8 addrspace(1)* %\(p)a_src_p, i64 \(aSrcStride), i64 1, <2 x i64> %\(p)a_stile,
+        <2 x i64> zeroinitializer, i32 0
+      )
+      store %event_t addrspace(3)* %\(p)a_ev, %event_t addrspace(3)** %\(p)ev0p
+      call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(p)ev0p)
+
+    """
+
+    return ir
+  }
+
+  // MARK: - Quantized B Dequant to TG
+
+  /// Cooperative dequantize: all threads load packed uint32 from device,
+  /// extract 4-bit nibbles, apply scale+bias, store f16 to TG B area.
+  ///
+  /// B (weights) layout: [N, K/8] uint32, row-major.
+  /// scales: [N, K/groupSize] f16. biases: same.
+  /// TG B layout: [K_group, N_group] f16 (non-transposed, ld = leadingBlockDimensions.B).
+  ///
+  /// Each thread processes elements in stride: tid, tid+totalThreads, ...
+  private func generateQuantizedBToTG(
+    prefix p: String,
+    kStart: UInt32, kTile: UInt32,
+    N_group: UInt16, K_group: UInt16,
+    blockBytesA: Int,
+    N: UInt32, K: UInt32, groupSize: UInt32
+  ) -> String {
+    let totalElements = UInt32(kTile) * UInt32(N_group)
+    let totalThreads = UInt32(threadgroupSize)
+    let packedK = K / 8
+    let groupsPerRow = K / groupSize
+    let ldBlockB = leadingBlockDimensions.B
+    // f16 is assumed for dequantized B in TG
+
+    var ir = "  ; === Cooperative dequant B iter \(p) (k=\(kStart)) ===\n"
+
+    // Compute flat thread ID: sidx * 32 + lane_id
+    ir += "  %\(p)dq_tid_base = mul i32 %sidx, 32\n"
+    ir += "  %\(p)dq_tid = add i32 %\(p)dq_tid_base, %lane_id\n"
+
+    // Cast buffer pointers
+    ir += "  %\(p)w_ptr = bitcast i8 addrspace(1)* %B to i32 addrspace(1)*\n"
+    ir += "  %\(p)s_ptr = bitcast i8 addrspace(1)* %scales_buf to half addrspace(1)*\n"
+    ir += "  %\(p)bi_ptr = bitcast i8 addrspace(1)* %biases_buf to half addrspace(1)*\n"
+
+    // TG B base pointer
+    ir += "  %\(p)b_tg_base = getelementptr i8, i8 addrspace(3)* %tg_base, i64 \(blockBytesA)\n"
+    ir += "  %\(p)b_tg_typed = bitcast i8 addrspace(3)* %\(p)b_tg_base to half addrspace(3)*\n"
+
+    // Stride loop: for idx = tid; idx < totalElements; idx += totalThreads
+    // Since this is IR, we need a proper loop with phi + branch.
+    ir += "  br label %\(p)dq_loop_header\n\n"
+
+    ir += "\(p)dq_loop_header:\n"
+    ir += "  %\(p)dq_idx = phi i32 [%\(p)dq_tid, %\(p)after_copy_a], [%\(p)dq_next_idx, %\(p)dq_do_store]\n"
+    ir += "  %\(p)dq_cmp = icmp ult i32 %\(p)dq_idx, \(totalElements)\n"
+    ir += "  br i1 %\(p)dq_cmp, label %\(p)dq_loop_body, label %\(p)dq_loop_exit\n\n"
+
+    ir += "\(p)dq_loop_body:\n"
+
+    // Decompose flat idx → (k_local, n_local)
+    // k_local = idx / N_group, n_local = idx % N_group
+    ir += "  %\(p)dq_k_local = udiv i32 %\(p)dq_idx, \(N_group)\n"
+    ir += "  %\(p)dq_n_local = urem i32 %\(p)dq_idx, \(N_group)\n"
+
+    // Global k and n
+    ir += "  %\(p)dq_k = add i32 %\(p)dq_k_local, \(kStart)\n"
+    ir += "  %\(p)dq_n = add i32 %\(p)dq_n_local, %N_offset\n"
+
+    // Bounds check: n < N and k < K
+    ir += "  %\(p)dq_n_ok = icmp ult i32 %\(p)dq_n, \(N)\n"
+    ir += "  %\(p)dq_k_ok = icmp ult i32 %\(p)dq_k, \(K)\n"
+    ir += "  %\(p)dq_ok = and i1 %\(p)dq_n_ok, %\(p)dq_k_ok\n"
+    ir += "  br i1 %\(p)dq_ok, label %\(p)dq_load, label %\(p)dq_store_zero\n\n"
+
+    // Load and dequantize
+    ir += "\(p)dq_load:\n"
+
+    // pack_idx = k / 8, sub_idx = k % 8
+    ir += "  %\(p)dq_pack_idx = lshr i32 %\(p)dq_k, 3\n"
+    ir += "  %\(p)dq_sub_idx = and i32 %\(p)dq_k, 7\n"
+
+    // weight address: w[n * packedK + pack_idx]
+    ir += "  %\(p)dq_w_row = mul i32 %\(p)dq_n, \(packedK)\n"
+    ir += "  %\(p)dq_w_off = add i32 %\(p)dq_w_row, %\(p)dq_pack_idx\n"
+    ir += "  %\(p)dq_w_off64 = zext i32 %\(p)dq_w_off to i64\n"
+    ir += "  %\(p)dq_w_gep = getelementptr i32, i32 addrspace(1)* %\(p)w_ptr, i64 %\(p)dq_w_off64\n"
+    ir += "  %\(p)dq_packed = load i32, i32 addrspace(1)* %\(p)dq_w_gep\n"
+
+    // Extract nibble: (packed >> (sub_idx * 4)) & 0xF
+    ir += "  %\(p)dq_shift = mul i32 %\(p)dq_sub_idx, 4\n"
+    ir += "  %\(p)dq_shifted = lshr i32 %\(p)dq_packed, %\(p)dq_shift\n"
+    ir += "  %\(p)dq_nibble = and i32 %\(p)dq_shifted, 15\n"
+
+    // group_idx = k / groupSize
+    ir += "  %\(p)dq_group_idx = udiv i32 %\(p)dq_k, \(groupSize)\n"
+
+    // scale address: scales[n * groupsPerRow + group_idx]
+    ir += "  %\(p)dq_s_row = mul i32 %\(p)dq_n, \(groupsPerRow)\n"
+    ir += "  %\(p)dq_s_off = add i32 %\(p)dq_s_row, %\(p)dq_group_idx\n"
+    ir += "  %\(p)dq_s_off64 = zext i32 %\(p)dq_s_off to i64\n"
+    ir += "  %\(p)dq_s_gep = getelementptr half, half addrspace(1)* %\(p)s_ptr, i64 %\(p)dq_s_off64\n"
+    ir += "  %\(p)dq_scale = load half, half addrspace(1)* %\(p)dq_s_gep\n"
+
+    // bias address: biases[n * groupsPerRow + group_idx]
+    ir += "  %\(p)dq_bi_gep = getelementptr half, half addrspace(1)* %\(p)bi_ptr, i64 %\(p)dq_s_off64\n"
+    ir += "  %\(p)dq_bias = load half, half addrspace(1)* %\(p)dq_bi_gep\n"
+
+    // Dequant: half(float(nibble) * scale + bias)
+    // Do in f32 for precision, then truncate to f16
+    ir += "  %\(p)dq_nibble_f = uitofp i32 %\(p)dq_nibble to float\n"
+    ir += "  %\(p)dq_scale_f = fpext half %\(p)dq_scale to float\n"
+    ir += "  %\(p)dq_bias_f = fpext half %\(p)dq_bias to float\n"
+    ir += "  %\(p)dq_mul = fmul fast float %\(p)dq_nibble_f, %\(p)dq_scale_f\n"
+    ir += "  %\(p)dq_val_f = fadd fast float %\(p)dq_mul, %\(p)dq_bias_f\n"
+    ir += "  %\(p)dq_val = fptrunc float %\(p)dq_val_f to half\n"
+
+    ir += "  br label %\(p)dq_do_store\n\n"
+
+    // Zero path for OOB
+    ir += "\(p)dq_store_zero:\n"
+    ir += "  br label %\(p)dq_do_store\n\n"
+
+    // Store to TG
+    ir += "\(p)dq_do_store:\n"
+    ir += "  %\(p)dq_store_val = phi half [%\(p)dq_val, %\(p)dq_load], [0xH0000, %\(p)dq_store_zero]\n"
+
+    // TG address depends on transpose state:
+    // Non-transposed B: B_block[k_local * ldBlockB + n_local] (rows=K, cols=N)
+    // Transposed B:     B_block[n_local * ldBlockB + k_local] (rows=N, cols=K)
+    if transposeState.B {
+      ir += "  %\(p)dq_tg_row = mul i32 %\(p)dq_n_local, \(ldBlockB)\n"
+      ir += "  %\(p)dq_tg_off = add i32 %\(p)dq_tg_row, %\(p)dq_k_local\n"
+    } else {
+      ir += "  %\(p)dq_tg_row = mul i32 %\(p)dq_k_local, \(ldBlockB)\n"
+      ir += "  %\(p)dq_tg_off = add i32 %\(p)dq_tg_row, %\(p)dq_n_local\n"
+    }
+    ir += "  %\(p)dq_tg_off64 = zext i32 %\(p)dq_tg_off to i64\n"
+    ir += "  %\(p)dq_tg_gep = getelementptr half, half addrspace(3)* %\(p)b_tg_typed, i64 %\(p)dq_tg_off64\n"
+    ir += "  store half %\(p)dq_store_val, half addrspace(3)* %\(p)dq_tg_gep\n"
+
+    // Loop increment
+    ir += "  %\(p)dq_next_idx = add i32 %\(p)dq_idx, \(totalThreads)\n"
+    ir += "  br label %\(p)dq_loop_header\n\n"
+
+    ir += "\(p)dq_loop_exit:\n"
+
+    return ir
+  }
 }
+
