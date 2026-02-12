@@ -20,9 +20,12 @@ public struct AttentionDescriptor {
   public var matrixDimensions: (row: UInt32, column: UInt32, head: UInt16)?
   
   public var transposeState: (Q: Bool, K: Bool, V: Bool, O: Bool)?
-  
+
+  /// Whether to apply causal masking (mask future tokens where col > row).
+  public var causal: Bool = false
+
   public init() {
-    
+
   }
 }
 
@@ -125,7 +128,8 @@ extension AttentionDescriptor {
     output.registerPrecisions = registerPrecisions
     output.transposeState = createTransposeState()
     output.type = type
-    
+    output.causal = causal
+
     return output
   }
 }
@@ -155,6 +159,7 @@ struct AttentionKey: Equatable, Hashable {
   var lowPrecisionIntermediates: UInt8
   var matrixDimensions: SIMD4<UInt32> // row, column, head, 0
   var transposeState: SIMD4<UInt8>    // Q, K, V, O
+  var causal: UInt8
 
   init(copying source: AttentionDescriptor) {
     lowPrecisionInputs = source.lowPrecisionInputs ? 1 : 0
@@ -169,6 +174,7 @@ struct AttentionKey: Equatable, Hashable {
     } else {
       transposeState = SIMD4(repeating: .max)
     }
+    causal = source.causal ? 1 : 0
   }
 }
 

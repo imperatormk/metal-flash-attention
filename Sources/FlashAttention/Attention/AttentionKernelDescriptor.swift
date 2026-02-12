@@ -42,8 +42,11 @@ public struct AttentionKernelDescriptor {
   public var transposeState: [AttentionOperand: Bool] = [:]
   
   public var type: AttentionKernelType?
-  
+
+  /// Whether to apply causal masking (mask future tokens where col > row).
+  public var causal: Bool = false
+
   public init() {
-    
+
   }
 }

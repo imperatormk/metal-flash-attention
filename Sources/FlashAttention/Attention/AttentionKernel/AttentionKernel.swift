@@ -17,7 +17,8 @@ public struct AttentionKernel {
   var preferAsyncLoad: Bool
   var registerPrecisions: [AttentionOperand: GEMMOperandPrecision]
   var transposeState: [AttentionOperand: Bool]
-  
+  var causal: Bool
+
   // Layout of the data in registers and threadgroup memory.
   public var blockDimensions: (
     parallelization: UInt16, traversal: UInt16, head: UInt16)
@@ -44,7 +45,8 @@ public struct AttentionKernel {
     self.preferAsyncLoad = preferAsyncLoad
     self.registerPrecisions = descriptor.registerPrecisions
     self.transposeState = descriptor.transposeState
-    
+    self.causal = descriptor.causal
+
     self.blockDimensions = blockDimensions
     self.headDimension = headDimension
 

@@ -257,15 +257,21 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
     encoder.setBuffer(bufferK, offset: 0, index: 1)
     encoder.setBuffer(bufferV, offset: 0, index: 2)
     encoder.setBuffer(bufferO, offset: 0, index: 3)
-    
+
     encoder.setBuffer(bufferL, offset: 0, index: 4)
     encoder.setBuffer(bufferD, offset: 0, index: 5)
-    
+
     encoder.setBuffer(bufferDerivativeO, offset: 0, index: 6)
     encoder.setBuffer(bufferDerivativeV, offset: 0, index: 7)
     encoder.setBuffer(bufferDerivativeK, offset: 0, index: 8)
     encoder.setBuffer(bufferDerivativeQ, offset: 0, index: 9)
-    
+
+    // BatchedParams: numHeads=1, all strides=0 (single-head)
+    var batchParams: [UInt32] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let bufferBatchParams = MTLContext.global.device.makeBuffer(
+      bytes: &batchParams, length: batchParams.count * 4, options: .storageModeShared)!
+    encoder.setBuffer(bufferBatchParams, offset: 0, index: 10)
+
     for _ in 0..<dispatchCount {
       dispatch(
         kernel: kernelForward,
