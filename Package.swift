@@ -19,7 +19,7 @@ let package = Package(
       targets: ["FlashAttention"]),
   ],
   dependencies: [
-    .package(name: "MetalASM", path: "../llvm"),
+    .package(url: "https://github.com/mpsops/MetalASM.git", from: "0.1.0"),
   ],
   targets: [
     // Targets are the basic building blocks of a package, defining a module or a test suite.
