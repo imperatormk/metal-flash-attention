@@ -95,7 +95,11 @@ extension GEMMKernel {
       let irDumpPath = "/tmp/mfa_gemm_debug.ll"
       try! ir.write(toFile: irDumpPath, atomically: true, encoding: .utf8)
 
+      #if os(macOS)
       let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+      #elseif os(iOS)
+      let metallibData = try! MetalASM.assemble(ir: ir, platform: .iOS(version: 26))
+      #endif
 
       // Write to temp file and load via URL to avoid in-memory data issues.
       guard let matrixDimensions = descriptor.matrixDimensions,
