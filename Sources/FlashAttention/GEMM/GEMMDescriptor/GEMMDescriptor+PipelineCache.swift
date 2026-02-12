@@ -88,6 +88,10 @@ extension GEMMKernel {
         descriptor.leadingDimensions?.C, false,
         matrixDimensions.M, matrixDimensions.N)
 
+      // Pass through quantization settings.
+      monoDesc.quantizedB = descriptor.quantizedB
+      monoDesc.groupSize = descriptor.groupSize
+
       // Generate monolithic LLVM IR and assemble in-process.
       let ir = kernel.createSource(descriptor: monoDesc)
 
@@ -156,5 +160,16 @@ extension GEMMKernel {
       let pipelineValue = createMonolithicPipeline(kernelDescriptor)
       GEMMKernel.pipelineCache[descriptor] = pipelineValue
     }
+  }
+
+  /// Convenience: get or compile a pipeline for a descriptor.
+  public static func pipeline(
+    for descriptor: GEMMDescriptor
+  ) -> PipelineValue {
+    if let cached = pipelineCache[descriptor] {
+      return cached
+    }
+    register(descriptor: descriptor)
+    return pipelineCache[descriptor]!
   }
 }

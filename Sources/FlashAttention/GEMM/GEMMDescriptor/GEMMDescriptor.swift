@@ -40,9 +40,15 @@ public struct GEMMDescriptor {
     A: GEMMOperandPrecision, B: GEMMOperandPrecision, C: GEMMOperandPrecision)?
   
   public var transposeState: (A: Bool, B: Bool)?
-  
+
+  /// When true, B is MLX-style 4-bit quantized:
+  /// Buffer B = packed uint32 weights [N, K/8], plus separate scales/biases f16.
+  /// Requires transposeState.B = true and two extra buffer bindings (scales, biases).
+  public var quantizedB: Bool = false
+  public var groupSize: UInt32 = 64
+
   public init() {
-    
+
   }
 }
 
@@ -52,11 +58,15 @@ struct GEMMKey: Equatable, Hashable {
   var matrixDimensions: SIMD3<UInt32>
   var memoryPrecisions: SIMD3<UInt16>
   var transposeState: SIMD2<UInt8>
- 
+  var quantizedB: UInt8
+  var groupSize: UInt32
+
   init(copying source: GEMMDescriptor) {
     batchDimension = source.batchDimension
     loadPreviousC = GEMMKernelKey.createBoolean(source.loadPreviousC)
     matrixDimensions = Self.createMatrixDimensions(source.matrixDimensions)
+    quantizedB = source.quantizedB ? 1 : 0
+    groupSize = source.groupSize
     memoryPrecisions = GEMMKernelKey.createPrecisions(source.memoryPrecisions)
     transposeState = GEMMKernelKey.createTransposeState(source.transposeState)
   }
