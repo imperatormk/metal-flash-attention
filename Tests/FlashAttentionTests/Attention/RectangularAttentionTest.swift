@@ -1,5 +1,6 @@
 import XCTest
 import FlashAttention
+import MetalASM
 
 final class RectangularAttentionTest: XCTestCase {
   // Tests random permutations of transpose state and input/output sequence
@@ -10,7 +11,7 @@ final class RectangularAttentionTest: XCTestCase {
       randomVecFloat = randomVecFloat * randomVecFloat * randomVecFloat
       var randomInts = SIMD2<Int>(randomVecFloat * SIMD2(128, 128))
       randomInts.replace(with: .one, where: randomInts .== .zero)
-      
+
       var matrixDimensions = (
         row: UInt32(randomInts[0]),
         column: UInt32.zero,
@@ -20,7 +21,7 @@ final class RectangularAttentionTest: XCTestCase {
       } else {
         matrixDimensions.column = UInt32.random(in: 10...128)
       }
-      
+
       var descriptor = AttentionDescriptor()
       descriptor.lowPrecisionInputs = Bool.random()
       descriptor.lowPrecisionIntermediates = Bool.random()
@@ -62,26 +63,41 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
   let kernelBackwardQuery = createKernel(type: .backwardQuery)
   let kernelBackwardKeyValue = createKernel(type: .backwardKeyValue)
   
-  func createPipeline(kernel: AttentionKernel) -> MTLComputePipelineState {
+  func createPipeline(
+    kernel: AttentionKernel,
+    type: AttentionKernelType
+  ) -> MTLComputePipelineState {
     let device = MTLContext.global.device
-    let source = kernel.createSource()
-    let library = try! device.makeLibrary(source: source, options: nil)
-    
-    let functionConstants = MTLFunctionConstantValues()
-    attentionDesc.setFunctionConstants(functionConstants)
-    let function = try! library.makeFunction(
-      name: "attention", constantValues: functionConstants)
-    
-    // A critical part of the heuristic: force the occupancy to 1024 on M1.
-    let pipelineDesc = MTLComputePipelineDescriptor()
-    pipelineDesc.computeFunction = function
-    pipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-    return try! device.makeComputePipelineState(
-      descriptor: pipelineDesc, options: [], reflection: nil)
+    guard let matrixDimensions = attentionDesc.matrixDimensions,
+          let transposeState = attentionDesc.transposeState else {
+      fatalError("Descriptor was incomplete.")
+    }
+
+    var monoDesc = AttentionKernel.MonolithicDescriptor()
+    monoDesc.R = matrixDimensions.row
+    monoDesc.C = matrixDimensions.column
+    let R = matrixDimensions.row
+    let C = matrixDimensions.column
+    let D = UInt32(matrixDimensions.head)
+    monoDesc.leadingDimensions[.Q] = transposeState.Q ? R : D
+    monoDesc.leadingDimensions[.K] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.V] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.O] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dO] = transposeState.O ? R : D
+    monoDesc.leadingDimensions[.dV] = transposeState.V ? C : D
+    monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
+    monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
+
+    let ir = kernel.createSource(descriptor: monoDesc)
+    let metallibData = try! MetalASM.assemble(ir: ir, platform: .macOS(version: 26))
+    let dispatchData = metallibData.withUnsafeBytes { DispatchData(bytes: $0) }
+    let library = try! device.makeLibrary(data: dispatchData)
+    let function = library.makeFunction(name: "attention")!
+    return try! device.makeComputePipelineState(function: function)
   }
-  let pipelineForward = createPipeline(kernel: kernelForward)
-  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery)
-  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue)
+  let pipelineForward = createPipeline(kernel: kernelForward, type: .forward)
+  let pipelineBackwardQuery = createPipeline(kernel: kernelBackwardQuery, type: .backwardQuery)
+  let pipelineBackwardKeyValue = createPipeline(kernel: kernelBackwardKeyValue, type: .backwardKeyValue)
   
   // MARK: - Transpose
   
@@ -212,7 +228,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
       encoder.setComputePipelineState(pipeline)
       encoder.setThreadgroupMemoryLength(
         Int(kernel.threadgroupMemoryAllocation), index: 0)
-      
+
       let blockCount = ceilDivide(
         parallelizationDimension, kernel.blockDimensions.parallelization)
       let gridSize = MTLSize(
@@ -326,7 +342,7 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
   // correctness failures. Start by making the O matrix agree on both CPU
   // and GPU. Then, get the remaining operands to match.
 #if false
-  
+
   // Displays a matrix with dimensions N * 1.
   func printVector(_ matrix: [Float]) {
     let sequenceDimension = matrix.count / 1
