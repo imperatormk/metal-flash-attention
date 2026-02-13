@@ -48,6 +48,8 @@ func irTypeName(_ precision: GEMMOperandPrecision) -> String {
   case .FP32: return "float"
   case .FP16: return "half"
   case .BF16: return "bfloat"
+  case .FP8_E4M3, .FP8_E5M2, .INT8, .NF4:
+    fatalError("Quantized types have no IR float type — dequantize first")
   }
 }
 
@@ -62,6 +64,8 @@ func irVecSuffix(_ precision: GEMMOperandPrecision) -> String {
   case .FP32: return "v64f32"
   case .FP16: return "v64f16"
   case .BF16: return "v64bf16"
+  case .FP8_E4M3, .FP8_E5M2, .INT8, .NF4:
+    fatalError("Quantized types have no IR vec suffix — dequantize first")
   }
 }
 
@@ -551,8 +555,9 @@ func irLog2Call(result: String, value: String) -> String {
 ///   4: L (read_write), 5: D (read_write),
 ///   6: dO (read), 7: dV (read_write), 8: dK (read_write), 9: dQ (read_write)
 func irAttentionKernelMetadata(kernelName: String = "attention") -> String {
-  // Build the function type signature: 11 device buffers + 1 TG + gid + sidx + lane_id
-  let ptrArgs = (0..<11).map { _ in "i8 addrspace(1)*" }.joined(separator: ", ")
+  // Build the function type signature: 15 device buffers + 1 TG + gid + sidx + lane_id
+  // Buffers: Q(0) K(1) V(2) O(3) L(4) D(5) dO(6) dV(7) dK(8) dQ(9) mask(10) bias(11) K_scale(20) V_scale(21) bp(30)
+  let ptrArgs = (0..<15).map { _ in "i8 addrspace(1)*" }.joined(separator: ", ")
   let fnType = "void (\(ptrArgs), i8 addrspace(3)*, <3 x i32>, i16, i16)"
 
   return """
@@ -573,7 +578,7 @@ func irAttentionKernelMetadata(kernelName: String = "attention") -> String {
 
   !0 = !{\(fnType)* @\(kernelName), !1, !2}
   !1 = !{}
-  !2 = !{!30, !31, !32, !33, !34, !35, !36, !37, !38, !39, !44, !40, !41, !42, !43}
+  !2 = !{!30, !31, !32, !33, !34, !35, !36, !37, !38, !39, !44, !45, !47, !48, !46, !40, !41, !42, !43}
   !30 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"Q"}
   !31 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"K"}
   !32 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"V"}
@@ -584,11 +589,15 @@ func irAttentionKernelMetadata(kernelName: String = "attention") -> String {
   !37 = !{i32 7, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dV"}
   !38 = !{i32 8, !"air.buffer", !"air.location_index", i32 8, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dK"}
   !39 = !{i32 9, !"air.buffer", !"air.location_index", i32 9, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dQ"}
-  !44 = !{i32 10, !"air.buffer", !"air.location_index", i32 10, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"batch_params"}
-  !40 = !{i32 11, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"tg_mem"}
-  !41 = !{i32 12, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
-  !42 = !{i32 13, !"air.simdgroup_index_in_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"sidx"}
-  !43 = !{i32 14, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane_id"}
+  !44 = !{i32 10, !"air.buffer", !"air.location_index", i32 10, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"mask"}
+  !45 = !{i32 11, !"air.buffer", !"air.location_index", i32 11, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"attn_bias"}
+  !47 = !{i32 12, !"air.buffer", !"air.location_index", i32 20, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"K_scale"}
+  !48 = !{i32 13, !"air.buffer", !"air.location_index", i32 21, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"V_scale"}
+  !46 = !{i32 14, !"air.buffer", !"air.location_index", i32 30, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"batch_params"}
+  !40 = !{i32 15, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"tg_mem"}
+  !41 = !{i32 16, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+  !42 = !{i32 17, !"air.simdgroup_index_in_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"sidx"}
+  !43 = !{i32 18, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane_id"}
 
   !8 = !{i32 1, !"wchar_size", i32 4}
   !9 = !{i32 7, !"air.max_device_buffers", i32 31}

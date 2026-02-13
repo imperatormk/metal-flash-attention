@@ -195,6 +195,8 @@ private func runCorrectnessTest(descriptor: GEMMDescriptor) {
           let sourceValue16 = castedPointer[Int(address)]
           let sourceValue16x2 = SIMD2<UInt16>(.zero, sourceValue16)
           sourceValue = unsafeBitCast(sourceValue16x2, to: Float.self)
+        default:
+          fatalError("Quantized types not supported here")
         }
         gpuOperandC[Int(address)] = sourceValue
       }

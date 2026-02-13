@@ -275,8 +275,8 @@ extension GEMMKernelDescriptor {
     func requiresLargeAllocation(_ precision: GEMMOperandPrecision) -> Bool {
       switch precision {
       case .FP32: return true
-      case .FP16: return false
-      case .BF16: return false
+      case .FP16, .BF16: return false
+      case .FP8_E4M3, .FP8_E5M2, .INT8, .NF4: return false
       }
     }
     var useLargeAllocation = false

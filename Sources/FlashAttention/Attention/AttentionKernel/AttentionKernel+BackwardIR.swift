@@ -223,7 +223,7 @@ extension AttentionKernel {
       derivScale: derivScale,
       dScalar: "%D_sram",
       pSource: "qs_p",   // from generateSoftmaxFromL with prefix "qs_"
-      dpSource: "dp_final"   // from generateOuterProduct with C_name "dp"
+      dpSource: "dp"   // from generateOuterProduct with C_name "dp"
     )
 
     // Step 5: dQ += dS * K (accumulate)
@@ -511,7 +511,7 @@ extension AttentionKernel {
       traversalDim: traversalDim,
       memD: memPrec(.D),
       pSource: "ks_p",   // from generateSoftmaxFromLVector with prefix "ks_"
-      dpSource: "dp_final"    // from generateOuterProduct with C_name "dp"
+      dpSource: "dp"    // from generateOuterProduct with C_name "dp"
     )
 
     // Step 6: dK += dS^T * Q (accumulate)

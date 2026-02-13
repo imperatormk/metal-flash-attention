@@ -180,31 +180,70 @@ extension AttentionKernel {
     ir += "  ; === Wait for V[c, d_outer=0] copy ===\n"
     ir += generateAsyncCopyWait(prefix: "wv_", eventSlot: 1)
 
+    // MARK: - Additive Bias (before scaling/masking)
+
+    var mi = "s_"  // mask input chain: s_ → ab_ → me_ → xm_
+    if hasAttnBias {
+      ir += generateAdditiveBias(
+        prefix: "ab_",
+        inputPrefix: mi,
+        sSramCount: sSramCount,
+        blockT: blockT,
+        traversalOffset: "%c",
+        regS: regS,
+        R: R, C: C
+      )
+      mi = "ab_s_"
+    }
+
     // MARK: - Mask Attention Matrix Edge
 
     ir += generateMaskEdge(
-      prefix: "mask_",
+      prefix: "me_",
       sSramCount: sSramCount,
       blockT: blockT, traversalDim: traversalDim,
       traversalOffset: "%c",
       regS: regS, scaleFactor: scaleFactor,
-      causal: causal
+      causal: causal,
+      windowSize: windowSize,
+      inputPrefix: mi
     )
+    mi = "me_s_"
+
+    // MARK: - External Mask
+
+    if hasMask {
+      ir += generateExternalMask(
+        prefix: "xm_",
+        inputPrefix: mi,
+        sSramCount: sSramCount,
+        blockT: blockT,
+        traversalOffset: "%c",
+        regS: regS,
+        R: R, C: C
+      )
+      mi = "xm_s_"
+    }
 
     // MARK: - Online Softmax: Reduce Maximum
 
+    let rmP = "rm_"   // reduceMax prefix
+    let coP = "co_"   // correctO prefix
+
     ir += generateReduceMax(
-      prefix: "rmax_",
+      prefix: rmP,
       sSramCount: sSramCount,
-      regS: regS, scaleFactor: scaleFactor
+      regS: regS, scaleFactor: scaleFactor,
+      inputPrefix: mi
     )
 
     // MARK: - Online Softmax: Correct O
 
     ir += generateCorrectO(
-      prefix: "corr_",
+      prefix: coP,
       oCachedCount: oCachedCount,
-      regO: regO
+      regO: regO,
+      reduceMaxPrefix: rmP
     )
 
     // MARK: - Online Softmax: Compute P = exp2(S * scale - m)
@@ -213,15 +252,19 @@ extension AttentionKernel {
       prefix: "sp_",
       sSramCount: sSramCount,
       regS: regS, regP: regP,
-      scaleFactor: scaleFactor
+      scaleFactor: scaleFactor,
+      inputPrefix: mi,
+      correctOPrefix: coP
     )
 
     // MARK: - Online Softmax: Reduce Sum
 
+    let rsP = "rs_"
     ir += generateReduceSum(
-      prefix: "rsum_",
+      prefix: rsP,
       sSramCount: sSramCount,
-      regP: regP
+      regP: regP,
+      correctOPrefix: coP
     )
 
     // MARK: - Accumulate O += P * V — V already in TG slot B
@@ -245,7 +288,7 @@ extension AttentionKernel {
       transposedB: transposed(.V),
       cachedC: isCachedO,
       isFinalScale: false,
-      scaleCorrection: "corr_correction",
+      scaleCorrection: "\(coP)correction",
       tgOffset: slotB,
       skipFirstIterCopy: true
     )
@@ -288,8 +331,8 @@ extension AttentionKernel {
     ir += """
 
     loop_latch:
-      %m_updated = phi float [%corr_m_upd, %wk_after_wait]
-      %l_updated = phi float [%rsum_l_new, %wk_after_wait]
+      %m_updated = phi float [%\(coP)m_upd, %wk_after_wait]
+      %l_updated = phi float [%\(rsP)l_new, %wk_after_wait]
 
     """
 

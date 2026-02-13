@@ -270,7 +270,10 @@ private func runCorrectnessTest(descriptor: AttentionDescriptor) {
     var batchParams: [UInt32] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     let bufferBatchParams = MTLContext.global.device.makeBuffer(
       bytes: &batchParams, length: batchParams.count * 4, options: .storageModeShared)!
-    encoder.setBuffer(bufferBatchParams, offset: 0, index: 10)
+    let dummyBuf = MTLContext.global.device.makeBuffer(length: 4, options: .storageModeShared)!
+    encoder.setBuffer(dummyBuf, offset: 0, index: 10)
+    encoder.setBuffer(dummyBuf, offset: 0, index: 11)
+    encoder.setBuffer(bufferBatchParams, offset: 0, index: 30)
 
     for _ in 0..<dispatchCount {
       dispatch(

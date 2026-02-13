@@ -46,6 +46,21 @@ public struct AttentionKernelDescriptor {
   /// Whether to apply causal masking (mask future tokens where col > row).
   public var causal: Bool = false
 
+  /// External attention mask buffer.
+  public var hasMask: Bool = false
+
+  /// Additive attention bias.
+  public var hasAttnBias: Bool = false
+  public var biasBatchStride: UInt32 = 0
+  public var biasHeadStride: UInt32 = 0
+  public var biasRepeatCount: UInt32 = 0
+
+  /// Sliding window size (nil = full attention).
+  public var windowSize: UInt32? = nil
+
+  /// Quantized K/V precision (nil = standard precision).
+  public var quantizedKV: GEMMOperandPrecision? = nil
+
   public init() {
 
   }
