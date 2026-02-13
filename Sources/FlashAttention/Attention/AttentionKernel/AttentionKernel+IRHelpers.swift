@@ -383,57 +383,69 @@ extension AttentionKernel {
     let isNF4 = (quantPrec == .NF4)
 
     if isNF4 {
-      // NF4: load 1 byte containing 2 nibbles
-      // The two elements are at adjacent head positions (even/odd)
-      // For transposed: row = head offset, col = seq offset
-      // For non-transposed: row = seq offset, col = head offset
-      // The packed byte is at addr = row * leadingBlockDim + col/2
-      // Low nibble = even col, high nibble = odd col
+      // NF4: 2 values packed per byte along the head dimension.
+      // Low nibble = even head position, high nibble = odd head position.
+      //
+      // The `transposed` flag here matches the TG load convention:
+      //   transposed=true:  row varies (2 elements at row, row+1), col is fixed
+      //                     → row = seq positions (morton_x+tOff), col = head (morton_y+kOff)
+      //   transposed=false: col varies (2 elements at col, col+1), row is fixed
+      //                     → row = seq, col = head positions
+      //
+      // For transposed=true (the common K case): both elements are at the SAME
+      // head position but different seq positions. We load 2 bytes (one per seq row)
+      // and extract the same nibble from each.
+      //
+      // For transposed=false: both elements are at adjacent head positions in the
+      // same seq row. We load 1 byte and extract both nibbles.
 
-      // Compute byte address for the packed byte
-      // Both elements share the same byte (adjacent along head dim, packed)
       if transposed {
-        // row = morton_x (head), col = morton_y (seq)
-        // packed_col = row / 2 (head is packed)
-        ir += "  %\(p)pack_col = lshr i32 \(rowOffset), 1\n"
-        ir += "  %\(p)addr = mul i32 \(colOffset), \(leadingBlockDim)\n"
-        ir += "  %\(p)addr2 = add i32 %\(p)addr, %\(p)pack_col\n"
+        // Two elements at (row+0, col) and (row+1, col), same head col.
+        // NF4 byte address: seq * leadingBlockDim + head/2
+        ir += "  %\(p)pack_head = lshr i32 \(colOffset), 1\n"
+        for elem in 0..<2 {
+          ir += "  %\(p)r_\(elem) = add i32 \(rowOffset), \(elem)\n"
+          ir += "  %\(p)addr_\(elem) = mul i32 %\(p)r_\(elem), \(leadingBlockDim)\n"
+          ir += "  %\(p)addr2_\(elem) = add i32 %\(p)addr_\(elem), %\(p)pack_head\n"
+          ir += "  %\(p)byte_\(elem) = zext i32 %\(p)addr2_\(elem) to i64\n"
+          if let off = tgOffsetI64 {
+            ir += "  %\(p)byteo_\(elem) = add i64 %\(p)byte_\(elem), \(off)\n"
+            ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byteo_\(elem)\n"
+          } else {
+            ir += "  %\(p)ptr_\(elem) = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte_\(elem)\n"
+          }
+          ir += "  %\(p)packed_\(elem) = load i8, i8 addrspace(3)* %\(p)ptr_\(elem)\n"
+        }
+        // Extract the same nibble from each byte based on head parity
+        ir += "  %\(p)head_odd = and i32 \(colOffset), 1\n"
+        ir += "  %\(p)is_odd = icmp ne i32 %\(p)head_odd, 0\n"
+        for elem in 0..<2 {
+          ir += "  %\(p)low_\(elem) = and i8 %\(p)packed_\(elem), 15\n"
+          ir += "  %\(p)high_\(elem) = lshr i8 %\(p)packed_\(elem), 4\n"
+          ir += "  %\(p)nib_\(elem) = select i1 %\(p)is_odd, i8 %\(p)high_\(elem), i8 %\(p)low_\(elem)\n"
+          ir += "  %\(p)idx\(elem) = zext i8 %\(p)nib_\(elem) to i32\n"
+        }
       } else {
-        // row = seq, col = head; packed along head (col)
+        // Two elements at (row, col+0) and (row, col+1), adjacent head positions.
+        // Both are in the same byte at row * leadingBlockDim + col/2.
         ir += "  %\(p)pack_col = lshr i32 \(colOffset), 1\n"
         ir += "  %\(p)addr = mul i32 \(rowOffset), \(leadingBlockDim)\n"
         ir += "  %\(p)addr2 = add i32 %\(p)addr, %\(p)pack_col\n"
+        ir += "  %\(p)byte = zext i32 %\(p)addr2 to i64\n"
+        if let off = tgOffsetI64 {
+          ir += "  %\(p)byteo = add i64 %\(p)byte, \(off)\n"
+          ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byteo\n"
+        } else {
+          ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte\n"
+        }
+        ir += "  %\(p)packed = load i8, i8 addrspace(3)* %\(p)ptr\n"
+        // col is even (morton_y is always even for non-transposed),
+        // so elem0 = low nibble, elem1 = high nibble
+        ir += "  %\(p)low_i8 = and i8 %\(p)packed, 15\n"
+        ir += "  %\(p)high_i8 = lshr i8 %\(p)packed, 4\n"
+        ir += "  %\(p)idx0 = zext i8 %\(p)low_i8 to i32\n"
+        ir += "  %\(p)idx1 = zext i8 %\(p)high_i8 to i32\n"
       }
-      ir += "  %\(p)byte = zext i32 %\(p)addr2 to i64\n"
-      if let off = tgOffsetI64 {
-        ir += "  %\(p)byteo = add i64 %\(p)byte, \(off)\n"
-        ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byteo\n"
-      } else {
-        ir += "  %\(p)ptr = getelementptr i8, i8 addrspace(3)* %tg_base, i64 %\(p)byte\n"
-      }
-      ir += "  %\(p)packed = load i8, i8 addrspace(3)* %\(p)ptr\n"
-
-      // Extract nibbles: low = even head pos, high = odd head pos
-      // Element 0 head offset is rowOffset (transposed) or colOffset
-      let headOffset = transposed ? rowOffset : colOffset
-      ir += "  %\(p)nibble_sel = and i32 \(headOffset), 1\n"
-      ir += "  %\(p)is_odd = icmp ne i32 %\(p)nibble_sel, 0\n"
-
-      // Low nibble (element 0 = even head position)
-      ir += "  %\(p)low_i8 = and i8 %\(p)packed, 15\n"
-      ir += "  %\(p)high_i8 = lshr i8 %\(p)packed, 4\n"
-
-      // Element 0: if head is even → low nibble, if odd → high nibble
-      ir += "  %\(p)nib0 = select i1 %\(p)is_odd, i8 %\(p)high_i8, i8 %\(p)low_i8\n"
-      // Element 1: head+1, so opposite nibble
-      ir += "  %\(p)nib1 = select i1 %\(p)is_odd, i8 %\(p)low_i8, i8 %\(p)high_i8\n"
-
-      // Wait — for SIMD matrix, each thread holds 2 elements at morton_x and morton_x+1
-      // morton_x is always even (0,2,4,6), so element 0 = even = low nibble, element 1 = odd = high nibble
-      // Actually let me simplify: morton_x is always even, so:
-      ir += "  ; morton_x is always even, so elem0=low nibble, elem1=high nibble\n"
-      ir += "  %\(p)idx0 = zext i8 %\(p)low_i8 to i32\n"
-      ir += "  %\(p)idx1 = zext i8 %\(p)high_i8 to i32\n"
 
       // Codebook lookup: NF4_CODEBOOK[idx] * scale
       ir += "  %\(p)cb0_ptr = getelementptr [16 x float], [16 x float] addrspace(2)* @NF4_CODEBOOK, i32 0, i32 %\(p)idx0\n"

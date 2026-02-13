@@ -33,7 +33,7 @@ final class MultiHeadCausalTest: XCTestCase {
     var packedQ = [Float](repeating: 0, count: numHeads * headElements)
     var packedK = [Float](repeating: 0, count: numHeads * headElements)
     var packedV = [Float](repeating: 0, count: numHeads * headElements)
-    var packedO = [Float](repeating: 0, count: numHeads * headElements)
+    let packedO = [Float](repeating: 0, count: numHeads * headElements)
     for h in 0..<numHeads {
       let off = h * headElements
       for i in 0..<headElements {

@@ -154,15 +154,18 @@ extension AttentionKernel {
   /// - Returns: MTLBuffer containing the BatchedParams struct.
   public static func createBatchedParamsBuffer(
     numHeads: UInt32, numKVHeads: UInt32? = nil, R: UInt32, C: UInt32, D: UInt32,
-    causalOffset: UInt32 = 0
+    causalOffset: UInt32 = 0, quantizedKV: GEMMOperandPrecision? = nil
   ) -> MTLBuffer {
     let kvHeads = numKVHeads ?? numHeads
     let kvRepeatFactor = numHeads / kvHeads
 
+    // For NF4, K/V pack 2 values per byte so stride is halved
+    let kvD = (quantizedKV == .NF4) ? D / 2 : D
+
     // Strides = per-head element count for each operand
     let qStride = R * D
-    let kStride = C * D
-    let vStride = C * D
+    let kStride = C * kvD
+    let vStride = C * kvD
     let oStride = R * D
     let lStride = R
     let dStride = R
