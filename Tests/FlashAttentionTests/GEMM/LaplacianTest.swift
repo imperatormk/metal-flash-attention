@@ -264,6 +264,8 @@ private func profileProblemSize(
             let entry16 = casted[address]
             let entry16x2 = SIMD2<UInt16>(.zero, entry16)
             entry32 = unsafeBitCast(entry16x2, to: Float.self)
+          default:
+            fatalError("Quantized types not supported here")
           }
           C[address] = entry32
         }
@@ -277,6 +279,8 @@ private func profileProblemSize(
     case .FP32: return 1e-5
     case .FP16: return 5e-3
     case .BF16: return 5e-2
+    default:
+      fatalError("Quantized types not supported here")
     }
   }
   var errorThreshold: Float = 0

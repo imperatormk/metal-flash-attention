@@ -40,6 +40,8 @@ extension MTLContext {
         let value16 = unsafeBitCast(value32, to: SIMD2<UInt16>.self)[1]
         pointer[i] = value16
       }
+    default:
+      fatalError("Quantized types not supported here")
     }
     return buffer
   }
@@ -58,7 +60,7 @@ extension MTLContext {
     for elementID in array.indices {
       let address = elementID
       var entry32: Float
-      
+
       switch precision {
       case .FP32:
         let casted = raw.assumingMemoryBound(to: Float.self)
@@ -72,6 +74,8 @@ extension MTLContext {
         let entry16 = casted[address]
         let entry16x2 = SIMD2<UInt16>(.zero, entry16)
         entry32 = unsafeBitCast(entry16x2, to: Float.self)
+      default:
+        fatalError("Quantized types not supported here")
       }
       array[address] = entry32
     }

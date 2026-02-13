@@ -18,6 +18,13 @@ public struct AttentionKernel {
   var registerPrecisions: [AttentionOperand: GEMMOperandPrecision]
   var transposeState: [AttentionOperand: Bool]
   var causal: Bool
+  var hasMask: Bool
+  var hasAttnBias: Bool
+  var biasBatchStride: UInt32
+  var biasHeadStride: UInt32
+  var biasRepeatCount: UInt32
+  var windowSize: UInt32?
+  var quantizedKV: GEMMOperandPrecision?
 
   // Layout of the data in registers and threadgroup memory.
   public var blockDimensions: (
@@ -46,6 +53,13 @@ public struct AttentionKernel {
     self.registerPrecisions = descriptor.registerPrecisions
     self.transposeState = descriptor.transposeState
     self.causal = descriptor.causal
+    self.hasMask = descriptor.hasMask
+    self.hasAttnBias = descriptor.hasAttnBias
+    self.biasBatchStride = descriptor.biasBatchStride
+    self.biasHeadStride = descriptor.biasHeadStride
+    self.biasRepeatCount = descriptor.biasRepeatCount
+    self.windowSize = descriptor.windowSize
+    self.quantizedKV = descriptor.quantizedKV
 
     self.blockDimensions = blockDimensions
     self.headDimension = headDimension
@@ -53,16 +67,18 @@ public struct AttentionKernel {
     // Compute forward TG slot size for double-buffering
     if type == .forward {
       var slotSize: UInt16 = 0
+      let kPrec = descriptor.memoryPrecisions[.K]!
       var kBytes: UInt16 = 1
       kBytes *= blockDimensions.traversal
-      kBytes *= blockDimensions.head
-      kBytes *= UInt16(descriptor.memoryPrecisions[.K]!.size)
+      kBytes *= (kPrec == .NF4) ? (blockDimensions.head / 2) : blockDimensions.head
+      kBytes *= UInt16(kPrec.size)
       slotSize = max(slotSize, kBytes)
 
+      let vPrec = descriptor.memoryPrecisions[.V]!
       var vBytes: UInt16 = 1
       vBytes *= blockDimensions.traversal
-      vBytes *= blockDimensions.head
-      vBytes *= UInt16(descriptor.memoryPrecisions[.V]!.size)
+      vBytes *= (vPrec == .NF4) ? (blockDimensions.head / 2) : blockDimensions.head
+      vBytes *= UInt16(vPrec.size)
       slotSize = max(slotSize, vBytes)
       forwardTGSlotSize = slotSize
     } else {
@@ -130,9 +146,11 @@ extension AttentionKernel {
       fatalError("Invalid precisions.")
     case (.FP32, .FP32):
       return "load"
+    default:
+      fatalError("Quantized types use custom IR load path.")
     }
   }
-  
+
   func storeFunction(_ operand: AttentionOperand) -> String {
     guard let memoryPrecision = memoryPrecisions[operand],
           let registerPrecision = registerPrecisions[operand] else {
@@ -160,6 +178,8 @@ extension AttentionKernel {
       fatalError("Invalid precisions.")
     case (.FP32, .FP32):
       return "store"
+    default:
+      fatalError("Quantized types use custom IR store path.")
     }
   }
   

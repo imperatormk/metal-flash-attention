@@ -8,21 +8,45 @@
 import Metal
 
 public struct AttentionDescriptor {
-  // Q, K, V, dO
+  // Q, K, V, dO - when true, uses FP16 for inputs
   public var lowPrecisionInputs: Bool = false
-  
+
+  // Q, K, V, dO - when true, uses BF16 for inputs (overrides lowPrecisionInputs)
+  public var useBF16Inputs: Bool = false
+
   // S, P, L, D, dP, dS
   public var lowPrecisionIntermediates: Bool = false
-  
+
+  // O, dV, dK, dQ - when true, outputs are low precision
+  public var lowPrecisionOutputs: Bool = false
+
+  // O - when true, output O uses BF16 instead of FP16
+  public var useBF16Outputs: Bool = false
+
+  // Causal masking - prevents attending to future tokens
+  public var causal: Bool = false
+
+  // External attention mask - expects a boolean mask buffer
+  public var hasMask: Bool = false
+
+  // Additive attention bias - added to attention scores before softmax
+  public var hasAttnBias: Bool = false
+  public var biasBatchStride: UInt32 = 0
+  public var biasHeadStride: UInt32 = 0
+  public var biasRepeatCount: UInt32 = 0
+
+  // Sliding window attention - each token only attends to windowSize previous tokens
+  public var windowSize: UInt32? = nil
+
+  // Quantized K/V cache (FP8, INT8, NF4)
+  public var quantizedKV: GEMMOperandPrecision? = nil
+
   // row:    Output sequence length; rows of the attention matrix.
   // column: Input sequence length; columns of the attention matrix.
   // head:   Head dimension, typically 32 - 256.
   public var matrixDimensions: (row: UInt32, column: UInt32, head: UInt16)?
-  
-  public var transposeState: (Q: Bool, K: Bool, V: Bool, O: Bool)?
 
-  /// Whether to apply causal masking (mask future tokens where col > row).
-  public var causal: Bool = false
+  public var transposeState: (Q: Bool, K: Bool, V: Bool, O: Bool)?
 
   public init() {
 
@@ -129,6 +153,13 @@ extension AttentionDescriptor {
     output.transposeState = createTransposeState()
     output.type = type
     output.causal = causal
+    output.hasMask = hasMask
+    output.hasAttnBias = hasAttnBias
+    output.biasBatchStride = biasBatchStride
+    output.biasHeadStride = biasHeadStride
+    output.biasRepeatCount = biasRepeatCount
+    output.windowSize = windowSize
+    output.quantizedKV = quantizedKV
 
     return output
   }
@@ -156,14 +187,27 @@ extension AttentionDescriptor {
 
 struct AttentionKey: Equatable, Hashable {
   var lowPrecisionInputs: UInt8
+  var useBF16Inputs: UInt8
   var lowPrecisionIntermediates: UInt8
+  var lowPrecisionOutputs: UInt8
+  var useBF16Outputs: UInt8
   var matrixDimensions: SIMD4<UInt32> // row, column, head, 0
   var transposeState: SIMD4<UInt8>    // Q, K, V, O
   var causal: UInt8
+  var hasMask: UInt8
+  var hasAttnBias: UInt8
+  var biasBatchStride: UInt32
+  var biasHeadStride: UInt32
+  var biasRepeatCount: UInt32
+  var windowSize: UInt32
+  var quantizedKV: UInt16
 
   init(copying source: AttentionDescriptor) {
     lowPrecisionInputs = source.lowPrecisionInputs ? 1 : 0
+    useBF16Inputs = source.useBF16Inputs ? 1 : 0
     lowPrecisionIntermediates = source.lowPrecisionIntermediates ? 1 : 0
+    lowPrecisionOutputs = source.lowPrecisionOutputs ? 1 : 0
+    useBF16Outputs = source.useBF16Outputs ? 1 : 0
     if let dims = source.matrixDimensions {
       matrixDimensions = SIMD4(dims.row, dims.column, UInt32(dims.head), 0)
     } else {
@@ -175,6 +219,13 @@ struct AttentionKey: Equatable, Hashable {
       transposeState = SIMD4(repeating: .max)
     }
     causal = source.causal ? 1 : 0
+    hasMask = source.hasMask ? 1 : 0
+    hasAttnBias = source.hasAttnBias ? 1 : 0
+    biasBatchStride = source.biasBatchStride
+    biasHeadStride = source.biasHeadStride
+    biasRepeatCount = source.biasRepeatCount
+    windowSize = source.windowSize ?? 0
+    quantizedKV = source.quantizedKV?.rawValue ?? 0
   }
 }
 

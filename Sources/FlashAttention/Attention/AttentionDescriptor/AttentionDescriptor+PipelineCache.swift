@@ -197,7 +197,7 @@ extension AttentionKernel {
     encoder.setComputePipelineState(pipeline)
     encoder.setThreadgroupMemoryLength(
       Int(kernel.threadgroupMemoryAllocation), index: 0)
-    encoder.setBuffer(batchedParams, offset: 0, index: 10)
+    encoder.setBuffer(batchedParams, offset: 0, index: 30)
 
     let blockCount = (parallelizationDimension + Int(kernel.blockDimensions.parallelization) - 1)
       / Int(kernel.blockDimensions.parallelization)

@@ -10,7 +10,12 @@ extension AttentionDescriptor {
   public var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] {
     var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision] = [:]
     
-    if lowPrecisionInputs {
+    if useBF16Inputs {
+      memoryPrecisions[.Q] = .BF16
+      memoryPrecisions[.K] = .BF16
+      memoryPrecisions[.V] = .BF16
+      memoryPrecisions[.dO] = .BF16
+    } else if lowPrecisionInputs {
       memoryPrecisions[.Q] = .FP16
       memoryPrecisions[.K] = .FP16
       memoryPrecisions[.V] = .FP16
@@ -21,7 +26,13 @@ extension AttentionDescriptor {
       memoryPrecisions[.V] = .FP32
       memoryPrecisions[.dO] = .FP32
     }
-    
+
+    // Override K/V precision if quantized KV cache is enabled
+    if let quantizedKV = self.quantizedKV {
+      memoryPrecisions[.K] = quantizedKV
+      memoryPrecisions[.V] = quantizedKV
+    }
+
     // Rounding error. In the test that reported these errors, the average
     // magnitude of any scalar was typically 1.0 to 10.0.
     //
@@ -137,10 +148,17 @@ extension AttentionDescriptor {
     // everything, just like the choice to always store log-sum-exp during the
     // forward pass. It also removes the concern of rounding error from
     // frequently truncating the FP32 numbers to FP16.
-    memoryPrecisions[.O] = .FP32
-    memoryPrecisions[.dV] = .FP32
-    memoryPrecisions[.dK] = .FP32
-    memoryPrecisions[.dQ] = .FP32
+    if lowPrecisionOutputs {
+      memoryPrecisions[.O] = useBF16Outputs ? .BF16 : .FP16
+      memoryPrecisions[.dV] = .FP32
+      memoryPrecisions[.dK] = .FP32
+      memoryPrecisions[.dQ] = .FP32
+    } else {
+      memoryPrecisions[.O] = .FP32
+      memoryPrecisions[.dV] = .FP32
+      memoryPrecisions[.dK] = .FP32
+      memoryPrecisions[.dQ] = .FP32
+    }
     
     return memoryPrecisions
   }
@@ -155,7 +173,13 @@ extension AttentionDescriptor {
     let hasNativeBF16Casting = device.supportsFamily(.apple9)
     
     // Inputs have the same register precision across kernels.
-    if lowPrecisionInputs {
+    if useBF16Inputs {
+      // BF16 inputs: use FP32 registers (BF16→FP32 promotion during load)
+      registerPrecisions[.Q] = .FP32
+      registerPrecisions[.K] = .FP32
+      registerPrecisions[.V] = .FP32
+      registerPrecisions[.dO] = .FP32
+    } else if lowPrecisionInputs {
       registerPrecisions[.Q] = .FP16
       registerPrecisions[.K] = .FP16
       registerPrecisions[.V] = .FP16
@@ -166,7 +190,13 @@ extension AttentionDescriptor {
       registerPrecisions[.V] = .FP32
       registerPrecisions[.dO] = .FP32
     }
-    
+
+    // Quantized K/V are always dequantized to FP16 in registers
+    if let quantizedKV = self.quantizedKV, quantizedKV.isQuantized {
+      registerPrecisions[.K] = .FP16
+      registerPrecisions[.V] = .FP16
+    }
+
     // The register precision of L/D only counts for backward key-value.
     if lowPrecisionIntermediates {
       registerPrecisions[.L] = .FP16

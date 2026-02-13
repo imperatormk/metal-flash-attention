@@ -97,7 +97,9 @@ final class DynamicRCTest: XCTestCase {
       enc.setBuffer(dummy, offset: 0, index: 7)  // dV
       enc.setBuffer(dummy, offset: 0, index: 8)  // dK
       enc.setBuffer(dummy, offset: 0, index: 9)  // dQ
-      enc.setBuffer(bufBP, offset: 0, index: 10)
+      enc.setBuffer(dummy, offset: 0, index: 10)
+      enc.setBuffer(dummy, offset: 0, index: 11)
+      enc.setBuffer(bufBP, offset: 0, index: 30)
 
       enc.setComputePipelineState(pipeline)
       enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)
@@ -200,7 +202,9 @@ final class DynamicRCTest: XCTestCase {
       enc.setBuffer(bufV, offset: 0, index: 2)
       enc.setBuffer(bufO, offset: 0, index: 3)
       enc.setBuffer(bufL, offset: 0, index: 4)
-      enc.setBuffer(bufBP, offset: 0, index: 10)
+      enc.setBuffer(dummy, offset: 0, index: 10)
+      enc.setBuffer(dummy, offset: 0, index: 11)
+      enc.setBuffer(bufBP, offset: 0, index: 30)
 
       enc.setComputePipelineState(pipeline)
       enc.setThreadgroupMemoryLength(Int(kernel.threadgroupMemoryAllocation), index: 0)

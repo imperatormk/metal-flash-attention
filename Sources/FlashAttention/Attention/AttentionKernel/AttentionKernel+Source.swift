@@ -81,26 +81,36 @@ extension AttentionKernel {
     }()
 
     // Leading dimension helpers
+    // For NF4 K/V (non-transposed), returns D/2 since 2 elements pack per byte.
     func leadingDim(_ operand: AttentionOperand) -> UInt32 {
-      if let ld = desc.leadingDimensions[operand] {
-        return ld
-      }
-      // Default: if transposed, leading dim = sequence length; else = D
-      if transposed(operand) {
+      var ld: UInt32
+      if let explicit_ld = desc.leadingDimensions[operand] {
+        ld = explicit_ld
+      } else if transposed(operand) {
         switch operand {
-        case .Q, .dQ: return R
-        case .K, .dK: return C
-        case .V, .dV: return C
-        case .O, .dO: return R
+        case .Q, .dQ: ld = R
+        case .K, .dK: ld = C
+        case .V, .dV: ld = C
+        case .O, .dO: ld = R
         default: fatalError("Unrecognized operand.")
         }
       } else {
-        return D
+        ld = D
       }
+      // NF4 packs 2 elements per byte along head dim
+      if memPrec(operand) == .NF4 && !transposed(operand) {
+        ld /= 2
+      }
+      return ld
     }
 
     func leadingBlockDim(_ operand: AttentionOperand) -> UInt32 {
-      UInt32(leadingBlockDimension(operand))
+      var lbd = UInt32(leadingBlockDimension(operand))
+      // NF4 packs 2 elements per byte along head dim
+      if memPrec(operand) == .NF4 && !transposed(operand) {
+        lbd /= 2
+      }
+      return lbd
     }
 
     // Memory precision helpers
@@ -188,6 +198,20 @@ extension AttentionKernel {
       ir += "  \(decl)\n"
     }
 
+    // NF4 codebook global (16 float values for 4-bit NormalFloat dequantization)
+    if quantizedKV == .NF4 {
+      ir += """
+
+      @NF4_CODEBOOK = internal addrspace(2) constant [16 x float] [
+        float -1.0, float -0.6961928009986877, float -0.5250730514526367, float -0.39491748809814453,
+        float -0.28444138169288635, float -0.18477343022823334, float -0.09105003625154495, float 0.0,
+        float 0.07958029955625534, float 0.16093020141124725, float 0.24611230194568634, float 0.33791524171829224,
+        float 0.44070982933044434, float 0.5626170039176941, float 0.7229568362236023, float 1.0
+      ]
+
+      """
+    }
+
     // Kernel function signature: 11 device buffers + 1 TG buffer + gid + sidx + lane_id
     // Buffer 10 = batch_params: [numHeads, kvRepeatFactor, Q_stride, K_stride,
     //   V_stride, O_stride, L_stride, D_stride, dO_stride, dV_stride, dK_stride,
@@ -205,6 +229,10 @@ extension AttentionKernel {
         i8 addrspace(1)* noundef "air-buffer-no-alias" %dV_base,
         i8 addrspace(1)* noundef "air-buffer-no-alias" %dK_base,
         i8 addrspace(1)* noundef "air-buffer-no-alias" %dQ_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %mask_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %bias_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %K_scale_base,
+        i8 addrspace(1)* noundef "air-buffer-no-alias" %V_scale_base,
         i8 addrspace(1)* noundef "air-buffer-no-alias" %bp_raw,
         i8 addrspace(3)* noundef %tg_base,
         <3 x i32> noundef %gid,
@@ -224,13 +252,25 @@ extension AttentionKernel {
 
       ; === Load batch params ===
       %bp_ptr = bitcast i8 addrspace(1)* %bp_raw to i32 addrspace(1)*
-      ; bp[0] = numHeads (unused here), bp[1] = kvRepeatFactor
+      ; bp[0] = numHeads, bp[1] = kvRepeatFactor
+      %numHeads = load i32, i32 addrspace(1)* %bp_ptr
       %bp_kvr_ptr = getelementptr i32, i32 addrspace(1)* %bp_ptr, i64 1
       %kvRepeatFactor = load i32, i32 addrspace(1)* %bp_kvr_ptr
 
-      ; Head indices: q_head = gid.y, kv_head = gid.y / kvRepeatFactor
+      ; Head indices: batch_head_idx = gid.y
       %batch_head_idx = bitcast i32 %gid_y to i32
       %kv_head_idx = udiv i32 %batch_head_idx, %kvRepeatFactor
+      ; Decompose into batch and head for bias strides
+      %batch_idx = udiv i32 %batch_head_idx, %numHeads
+      %head_idx = urem i32 %batch_head_idx, %numHeads
+
+      ; Load K/V dequantization scales (float, indexed by batch_head_idx)
+      %K_scale_fptr = bitcast i8 addrspace(1)* %K_scale_base to float addrspace(1)*
+      %K_scale_ptr = getelementptr float, float addrspace(1)* %K_scale_fptr, i32 %batch_head_idx
+      %K_scale = load float, float addrspace(1)* %K_scale_ptr
+      %V_scale_fptr = bitcast i8 addrspace(1)* %V_scale_base to float addrspace(1)*
+      %V_scale_ptr = getelementptr float, float addrspace(1)* %V_scale_fptr, i32 %batch_head_idx
+      %V_scale = load float, float addrspace(1)* %V_scale_ptr
 
       ; Load per-operand strides from bp[2..13]
     """
