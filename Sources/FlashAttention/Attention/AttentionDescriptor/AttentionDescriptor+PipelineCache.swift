@@ -12,6 +12,7 @@ public class FlashAttentionLog: @unchecked Sendable {
   private let lock = NSLock()
   private var _entries: [String] = []
   public var onChange: (() -> Void)?
+  private let echo = ProcessInfo.processInfo.environment["MFA_DEBUG"] == "1"
 
   public var entries: [String] {
     lock.lock()
@@ -23,7 +24,7 @@ public class FlashAttentionLog: @unchecked Sendable {
     lock.lock()
     _entries.append(message)
     lock.unlock()
-    print(message)
+    if echo { print(message) }
     DispatchQueue.main.async { self.onChange?() }
   }
 
