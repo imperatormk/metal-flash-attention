@@ -138,10 +138,6 @@ extension AttentionKernel {
       // Backends that cannot lower simdgroup async copy (M5) fail here rather
       // than at dispatch; regenerate with cooperative copies for the rest of
       // the process.
-      FlashAttentionLog.shared.append(
-        "async copy pipeline failed on \(device.name): \(error)")
-      FlashAttentionLog.shared.append(
-        "async copy: unsupported on this device, using cooperative copies from now on")
       MTLContext.asyncCopyEnabled = false
       kernelDesc.useAsyncCopy = false
       kernel = AttentionKernel(descriptor: kernelDesc)

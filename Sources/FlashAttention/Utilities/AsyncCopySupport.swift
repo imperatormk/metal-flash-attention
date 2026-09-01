@@ -20,10 +20,7 @@ extension MTLContext {
     guard let forced = ProcessInfo.processInfo.environment["MFA_ASYNC_COPY"] else {
       return true
     }
-    let on = !(forced == "0" || forced.lowercased() == "false")
-    FlashAttentionLog.shared.append(
-      "async copy: forced \(on ? "on" : "off") via MFA_ASYNC_COPY")
-    return on
+    return !(forced == "0" || forced.lowercased() == "false")
   }()
 
   /// True when the setting came from the environment, so a failed compile
