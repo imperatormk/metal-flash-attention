@@ -15,6 +15,7 @@ public struct AttentionKernel {
   var memoryPrecisions: [AttentionOperand: GEMMOperandPrecision]
   var preferAsyncCache: Bool
   var preferAsyncLoad: Bool
+  var useAsyncCopy: Bool
   var registerPrecisions: [AttentionOperand: GEMMOperandPrecision]
   var transposeState: [AttentionOperand: Bool]
   var causal: Bool
@@ -50,6 +51,7 @@ public struct AttentionKernel {
     self.memoryPrecisions = descriptor.memoryPrecisions
     self.preferAsyncCache = preferAsyncCache
     self.preferAsyncLoad = preferAsyncLoad
+    self.useAsyncCopy = descriptor.useAsyncCopy ?? true
     self.registerPrecisions = descriptor.registerPrecisions
     self.transposeState = descriptor.transposeState
     self.causal = descriptor.causal

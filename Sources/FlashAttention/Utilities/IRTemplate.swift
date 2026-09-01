@@ -522,7 +522,7 @@ func irQuantizedGEMMKernelMetadata(kernelName: String = "gemm") -> String {
 func irAttentionIntrinsicDeclarations() -> String {
   """
 
-  declare float @air.simd_shuffle_xor.f32(float, i32) #1
+  declare float @air.simd_shuffle_xor.f32(float, i16) #1
   declare float @llvm.exp2.f32(float) #1
   declare float @llvm.log2.f32(float) #1
   """
@@ -532,7 +532,8 @@ func irAttentionIntrinsicDeclarations() -> String {
 func irShuffleXorCall(
   result: String, value: String, mask: Int
 ) -> String {
-  "  \(result) = call float @air.simd_shuffle_xor.f32(float \(value), i32 \(mask))"
+  // The mask is a `ushort` in MSL; M5's backend rejects an i32 operand.
+  "  \(result) = call float @air.simd_shuffle_xor.f32(float \(value), i16 \(mask))"
 }
 
 /// Generate a fast exp2 call.

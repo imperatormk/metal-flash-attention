@@ -22,7 +22,12 @@ public struct AttentionKernelDescriptor {
   
   /// Reads that are shared among threads (like GEMM load).
   public var preferAsyncLoad: Bool?
-  
+
+  /// Emit simdgroup async copies in the monolithic IR kernels. When false,
+  /// the same tiles are copied cooperatively by all threads. Defaults to
+  /// `MTLContext.supportsSimdgroupAsyncCopy`.
+  public var useAsyncCopy: Bool?
+
   public var registerPrecisions: [AttentionOperand: GEMMOperandPrecision] = [:]
   
   /// Whether each operand is transposed in RAM.

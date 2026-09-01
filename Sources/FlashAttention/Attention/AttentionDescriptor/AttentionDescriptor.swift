@@ -149,6 +149,7 @@ extension AttentionDescriptor {
       output.preferAsyncCache = false
       output.preferAsyncLoad = true
     }
+    output.useAsyncCopy = MTLContext.asyncCopyEnabled
     output.registerPrecisions = registerPrecisions
     output.transposeState = createTransposeState()
     output.type = type

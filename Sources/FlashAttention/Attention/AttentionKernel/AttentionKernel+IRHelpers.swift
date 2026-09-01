@@ -31,6 +31,14 @@ extension AttentionKernel {
     tgOffset: String = "0",
     eventSlot: Int = 0
   ) -> String {
+    if !useAsyncCopy {
+      return generateCooperativeCopyDeviceToTG(
+        prefix: p, buffer: buffer, operand: operand, dOuter: dOuter,
+        seqOffset: seqOffset, seqDim: seqDim, blockSeq: blockSeq,
+        blockHead: blockHead, D: D, leadingDim: leadingDim,
+        leadingBlockDim: leadingBlockDim, memPrec: memPrec,
+        transposed: transposed, tgOffset: tgOffset)
+    }
     let elemSize = UInt32(memPrec.size)
     let isNF4 = (memPrec == .NF4)
     var ir = ""
@@ -138,6 +146,11 @@ extension AttentionKernel {
     prefix p: String,
     eventSlot: Int = 0
   ) -> String {
+    if !useAsyncCopy {
+      // Keep the after_wait block: loop latches use it as a phi predecessor.
+      return "  br label %\(p)after_wait\n\n\(p)after_wait:\n"
+        + "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
+    }
     var ir = ""
     ir += "  ; Wait for async copy (\(p))\n"
     ir += "  br i1 %is_sidx0, label %\(p)do_wait, label %\(p)skip_wait\n\n"
@@ -172,6 +185,14 @@ extension AttentionKernel {
   ) -> String {
     let elemSize = UInt32(memPrec.size)
     let isNF4 = (memPrec == .NF4)
+    if !useAsyncCopy {
+      return generateCooperativeCopyDeviceToTG(
+        prefix: p, buffer: buffer, operand: operand, dOuter: dOuter,
+        seqOffset: seqOffset, seqDim: seqDim, blockSeq: blockSeq,
+        blockHead: blockHead, D: D, leadingDim: leadingDim,
+        leadingBlockDim: leadingBlockDim, memPrec: memPrec,
+        transposed: transposed, tgOffset: tgOffset)
+    }
     var ir = ""
 
     ir += "  ; Async copy \(operand) device→TG (\(p))\n"
@@ -1868,8 +1889,10 @@ extension AttentionKernel {
 
       // Async copy TG → device (gated to sidx==0)
       let cp = "\(ip)cp_"
-      ir += "  br i1 %is_sidx0, label %\(cp)do, label %\(cp)skip\n\n"
-      ir += "\(cp)do:\n"
+      if useAsyncCopy {
+        ir += "  br i1 %is_sidx0, label %\(cp)do, label %\(cp)skip\n\n"
+        ir += "\(cp)do:\n"
+      }
 
       // Device offset: par_group_off * leadingDimO + dOuter (non-transposed)
       if transposedO {
@@ -1894,37 +1917,48 @@ extension AttentionKernel {
       let dstStride = leadingDimO * elemSizeO
       let srcStride = leadingBlockDimO * elemSizeO
 
-      let (tileW, tileH): (String, String)
+      let (tileW, tileH, tileW32, tileH32): (String, String, String, String)
       if transposedO {
         // Width = seq elements, Height = D elements
         ir += "  %\(cp)w_bytes32 = mul i32 %\(cp)seq_tile32, \(elemSizeO)\n"
         ir += "  %\(cp)w_bytes = zext i32 %\(cp)w_bytes32 to i64\n"
         tileW = "%\(cp)w_bytes"
         tileH = "\(dTile)"
+        tileW32 = "%\(cp)w_bytes32"
+        tileH32 = "\(dTile)"
       } else {
         // Width = D elements, Height = seq elements
         tileW = "\(dTile * elemSizeO)"
         tileH = "%\(cp)seq_tile"
+        tileW32 = "\(dTile * elemSizeO)"
+        tileH32 = "%\(cp)seq_tile32"
       }
 
-      ir += "  %\(cp)tile_w = insertelement <2 x i64> zeroinitializer, i64 \(tileW), i32 0\n"
-      ir += "  %\(cp)tile = insertelement <2 x i64> %\(cp)tile_w, i64 \(tileH), i32 1\n"
+      if useAsyncCopy {
+        ir += "  %\(cp)tile_w = insertelement <2 x i64> zeroinitializer, i64 \(tileW), i32 0\n"
+        ir += "  %\(cp)tile = insertelement <2 x i64> %\(cp)tile_w, i64 \(tileH), i32 1\n"
 
-      ir += "  %\(cp)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
-      ir += """
-        %\(cp)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p1i8.p3i8(
-          i64 1, i64 1,
-          i8 addrspace(1)* %\(cp)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(cp)tile,
-          i8 addrspace(3)* %\(cp)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(cp)tile,
-          <2 x i64> zeroinitializer, i32 0
-        )
-        store %event_t addrspace(3)* %\(cp)ev, %event_t addrspace(3)** %\(cp)evp
-        call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(cp)evp)
+        ir += "  %\(cp)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
+        ir += """
+          %\(cp)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p1i8.p3i8(
+            i64 1, i64 1,
+            i8 addrspace(1)* %\(cp)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(cp)tile,
+            i8 addrspace(3)* %\(cp)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(cp)tile,
+            <2 x i64> zeroinitializer, i32 0
+          )
+          store %event_t addrspace(3)* %\(cp)ev, %event_t addrspace(3)** %\(cp)evp
+          call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(cp)evp)
 
-      """
+        """
 
-      ir += "  br label %\(cp)skip\n\n"
-      ir += "\(cp)skip:\n"
+        ir += "  br label %\(cp)skip\n\n"
+        ir += "\(cp)skip:\n"
+      } else {
+        ir += generateCooperativeStoreTGToDevice(
+          prefix: cp, dstPtr: "%\(cp)dst_p", srcPtr: "%\(cp)src_p",
+          tileWBytes: tileW32, tileH: tileH32,
+          dstStride: dstStride, srcStride: srcStride, unit: elemSizeO)
+      }
       ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
 
       dOuter += UInt32(blockH)
@@ -2579,8 +2613,10 @@ extension AttentionKernel {
 
       // Async copy TG → device
       let cp = "\(ip)cp_"
-      ir += "  br i1 %is_sidx0, label %\(cp)do, label %\(cp)skip\n\n"
-      ir += "\(cp)do:\n"
+      if useAsyncCopy {
+        ir += "  br i1 %is_sidx0, label %\(cp)do, label %\(cp)skip\n\n"
+        ir += "\(cp)do:\n"
+      }
 
       if transposed {
         ir += "  %\(cp)dev_row = mul i32 \(dOuter), \(leadingDim)\n"
@@ -2603,35 +2639,46 @@ extension AttentionKernel {
       let dstStride = leadingDim * elemSize
       let srcStride = leadingBlockDim * elemSize
 
-      let (tileW, tileH): (String, String)
+      let (tileW, tileH, tileW32, tileH32): (String, String, String, String)
       if transposed {
         ir += "  %\(cp)w_bytes32 = mul i32 %\(cp)seq_tile32, \(elemSize)\n"
         ir += "  %\(cp)w_bytes = zext i32 %\(cp)w_bytes32 to i64\n"
         tileW = "%\(cp)w_bytes"
         tileH = "\(dTile)"
+        tileW32 = "%\(cp)w_bytes32"
+        tileH32 = "\(dTile)"
       } else {
         tileW = "\(dTile * elemSize)"
         tileH = "%\(cp)seq_tile"
+        tileW32 = "\(dTile * elemSize)"
+        tileH32 = "%\(cp)seq_tile32"
       }
 
-      ir += "  %\(cp)tile_w = insertelement <2 x i64> zeroinitializer, i64 \(tileW), i32 0\n"
-      ir += "  %\(cp)tile = insertelement <2 x i64> %\(cp)tile_w, i64 \(tileH), i32 1\n"
+      if useAsyncCopy {
+        ir += "  %\(cp)tile_w = insertelement <2 x i64> zeroinitializer, i64 \(tileW), i32 0\n"
+        ir += "  %\(cp)tile = insertelement <2 x i64> %\(cp)tile_w, i64 \(tileH), i32 1\n"
 
-      ir += "  %\(cp)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
-      ir += """
-        %\(cp)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p1i8.p3i8(
-          i64 1, i64 1,
-          i8 addrspace(1)* %\(cp)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(cp)tile,
-          i8 addrspace(3)* %\(cp)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(cp)tile,
-          <2 x i64> zeroinitializer, i32 0
-        )
-        store %event_t addrspace(3)* %\(cp)ev, %event_t addrspace(3)** %\(cp)evp
-        call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(cp)evp)
+        ir += "  %\(cp)evp = getelementptr [2 x %event_t addrspace(3)*], [2 x %event_t addrspace(3)*]* %ev, i64 0, i64 0\n"
+        ir += """
+          %\(cp)ev = call %event_t addrspace(3)* @air.simdgroup_async_copy_2d.p1i8.p3i8(
+            i64 1, i64 1,
+            i8 addrspace(1)* %\(cp)dst_p, i64 \(dstStride), i64 1, <2 x i64> %\(cp)tile,
+            i8 addrspace(3)* %\(cp)src_p, i64 \(srcStride), i64 1, <2 x i64> %\(cp)tile,
+            <2 x i64> zeroinitializer, i32 0
+          )
+          store %event_t addrspace(3)* %\(cp)ev, %event_t addrspace(3)** %\(cp)evp
+          call void @air.wait_simdgroup_events(i32 1, %event_t addrspace(3)** %\(cp)evp)
 
-      """
+        """
 
-      ir += "  br label %\(cp)skip\n\n"
-      ir += "\(cp)skip:\n"
+        ir += "  br label %\(cp)skip\n\n"
+        ir += "\(cp)skip:\n"
+      } else {
+        ir += generateCooperativeStoreTGToDevice(
+          prefix: cp, dstPtr: "%\(cp)dst_p", srcPtr: "%\(cp)src_p",
+          tileWBytes: tileW32, tileH: tileH32,
+          dstStride: dstStride, srcStride: srcStride, unit: elemSize)
+      }
       ir += "  call void @air.wg.barrier(i32 2, i32 1)\n\n"
 
       dOuter += UInt32(blockH)

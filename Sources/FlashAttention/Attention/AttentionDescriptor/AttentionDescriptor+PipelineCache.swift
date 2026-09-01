@@ -97,28 +97,60 @@ extension AttentionKernel {
     monoDesc.leadingDimensions[.dK] = transposeState.K ? C : D
     monoDesc.leadingDimensions[.dQ] = transposeState.Q ? R : D
 
-    let t1 = CFAbsoluteTimeGetCurrent()
-    let kernelDesc = descriptor.kernelDescriptor(type: type)
-    let kernel = AttentionKernel(descriptor: kernelDesc)
+    struct PipelineBuildError: Error, CustomStringConvertible {
+      let description: String
+    }
+    func build(_ ir: String) throws -> (MTLComputePipelineState, Double) {
+      if let dir = ProcessInfo.processInfo.environment["MFA_DUMP_IR"] {
+        let name = "attention_\(type)_\(kernelDesc.useAsyncCopy == true ? "async" : "coop").ll"
+        try? ir.write(toFile: "\(dir)/\(name)", atomically: true, encoding: .utf8)
+      }
+      let t2 = CFAbsoluteTimeGetCurrent()
+      #if os(macOS)
+      let metallibData = try MetalASM.assemble(
+        ir: ir, platform: .macOS(version: 26))
+      #elseif os(iOS)
+      let metallibData = try MetalASM.assemble(
+        ir: ir, platform: .iOS(version: 26))
+      #endif
+      let t3 = CFAbsoluteTimeGetCurrent()
+      let library = try metallibData.withUnsafeBytes {
+        try device.makeLibrary(data: DispatchData(bytes: $0))
+      }
+      guard let function = library.makeFunction(name: "attention") else {
+        throw PipelineBuildError(description: "no 'attention' function in metallib")
+      }
+      return (try device.makeComputePipelineState(function: function), t3 - t2)
+    }
 
-    let ir = kernel.createSource(descriptor: monoDesc)
+    let t1 = CFAbsoluteTimeGetCurrent()
+    var kernelDesc = descriptor.kernelDescriptor(type: type)
+    kernelDesc.useAsyncCopy = MTLContext.asyncCopyEnabled
+    var kernel = AttentionKernel(descriptor: kernelDesc)
+    var ir = kernel.createSource(descriptor: monoDesc)
     let t2 = CFAbsoluteTimeGetCurrent()
 
-    #if os(macOS)
-    let metallibData = try! MetalASM.assemble(
-      ir: ir, platform: .macOS(version: 26))
-    #elseif os(iOS)
-    let metallibData = try! MetalASM.assemble(
-      ir: ir, platform: .iOS(version: 26))
-    #endif
-    let t3 = CFAbsoluteTimeGetCurrent()
-
-    let dispatchData = metallibData.withUnsafeBytes {
-      DispatchData(bytes: $0)
+    var pipeline: MTLComputePipelineState
+    var asmTime: Double
+    do {
+      (pipeline, asmTime) = try build(ir)
+    } catch where kernelDesc.useAsyncCopy == true && !MTLContext.asyncCopyForced {
+      // Backends that cannot lower simdgroup async copy (M5) fail here rather
+      // than at dispatch; regenerate with cooperative copies for the rest of
+      // the process.
+      FlashAttentionLog.shared.append(
+        "async copy pipeline failed on \(device.name): \(error)")
+      FlashAttentionLog.shared.append(
+        "async copy: UNSUPPORTED — using cooperative copies from now on")
+      MTLContext.asyncCopyEnabled = false
+      kernelDesc.useAsyncCopy = false
+      kernel = AttentionKernel(descriptor: kernelDesc)
+      ir = kernel.createSource(descriptor: monoDesc)
+      (pipeline, asmTime) = try! build(ir)
+    } catch {
+      fatalError("attention pipeline build failed on \(device.name): \(error)")
     }
-    let library = try! device.makeLibrary(data: dispatchData)
-    let function = library.makeFunction(name: "attention")!
-    let pipeline = try! device.makeComputePipelineState(function: function)
+    let t3 = t2 + asmTime
     let t4 = CFAbsoluteTimeGetCurrent()
 
     FlashAttentionLog.shared.append(
