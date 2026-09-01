@@ -141,7 +141,7 @@ extension AttentionKernel {
       FlashAttentionLog.shared.append(
         "async copy pipeline failed on \(device.name): \(error)")
       FlashAttentionLog.shared.append(
-        "async copy: UNSUPPORTED — using cooperative copies from now on")
+        "async copy: unsupported on this device, using cooperative copies from now on")
       MTLContext.asyncCopyEnabled = false
       kernelDesc.useAsyncCopy = false
       kernel = AttentionKernel(descriptor: kernelDesc)
